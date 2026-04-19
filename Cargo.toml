@@ -1,0 +1,25 @@
+[package]
+name = "netwatch-agent"
+version = "0.3.0"
+edition = "2021"
+description = "Lightweight agent for NetWatch Cloud — collects network, system, and process metrics on Linux and macOS hosts and POSTs them to the hosted SaaS backend."
+license = "MIT"
+repository = "https://github.com/matthart1983/netwatch-agent"
+homepage = "https://github.com/matthart1983/netwatch-agent"
+readme = "README.md"
+
+[dependencies]
+# Wire format + collectors. Track main until we publish 0.1.0 to crates.io,
+# after which this becomes `netwatch-sdk = "0.1"`.
+netwatch-sdk = { git = "https://github.com/matthart1983/netwatch-sdk", branch = "main" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pcap = "2"
