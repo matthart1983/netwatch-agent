@@ -9,9 +9,7 @@ homepage = "https://github.com/matthart1983/netwatch-agent"
 readme = "README.md"
 
 [dependencies]
-# Wire format + collectors. Track main until we publish 0.1.0 to crates.io,
-# after which this becomes `netwatch-sdk = "0.1"`.
-netwatch-sdk = { git = "https://github.com/matthart1983/netwatch-sdk", branch = "main" }
+netwatch-sdk = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
