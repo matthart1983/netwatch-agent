@@ -16,6 +16,7 @@ const MAX_PROCESSES_PER_SNAPSHOT: usize = 25;
 
 pub struct MetricsCollector {
     rate_tracker: traffic::InterfaceRateTracker,
+    proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker,
     gateway_rtt_history: health::RttHistory,
     dns_rtt_history: health::RttHistory,
     intel: Arc<Mutex<NetworkIntelCollector>>,
@@ -47,6 +48,7 @@ impl MetricsCollector {
 
         Self {
             rate_tracker: traffic::InterfaceRateTracker::new(),
+            proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker::new(),
             gateway_rtt_history: health::RttHistory::new(),
             dns_rtt_history: health::RttHistory::new(),
             intel: Arc::new(Mutex::new(intel)),
@@ -120,11 +122,11 @@ impl MetricsCollector {
                 .count() as u32,
         );
         let processes = {
-            let ranked = process_bandwidth::attribute(
-                &raw_connections,
-                &interfaces,
-                MAX_PROCESSES_PER_SNAPSHOT,
-            );
+            // Real per-process bandwidth measured from per-socket byte deltas
+            // (see ProcessBandwidthTracker), not the old proportional split.
+            let ranked = self
+                .proc_bw_tracker
+                .sample(&raw_connections, MAX_PROCESSES_PER_SNAPSHOT);
             if ranked.is_empty() {
                 None
             } else {
