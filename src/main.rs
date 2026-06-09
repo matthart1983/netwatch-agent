@@ -6,6 +6,7 @@ mod capture;
 mod collector;
 mod config;
 mod host;
+mod otel;
 mod sender;
 mod update;
 
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
     info!("interval: {}s, health interval: {}s", cfg.interval_secs, cfg.health_interval_secs);
 
     let mut collector = collector::MetricsCollector::new(&cfg);
+    let hostname = host_info.hostname.clone();
     let mut sender = sender::Sender::new(&cfg, host_info);
 
     if cfg.packet_capture.enabled {
@@ -90,8 +92,38 @@ async fn main() -> Result<()> {
     let health_interval = Duration::from_secs(cfg.health_interval_secs);
     let mut last_health = tokio::time::Instant::now() - health_interval;
 
+    // Optional OTLP metrics export — enabled by `--otlp` / `--otlp-endpoint <url>`
+    // or the standard OTEL_EXPORTER_OTLP_(METRICS_)ENDPOINT env vars. Best-effort:
+    // a failed init never stops the agent.
+    let otlp_endpoint = args
+        .iter()
+        .position(|a| a == "--otlp-endpoint")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let otlp_enabled = otlp_endpoint.is_some()
+        || args.iter().any(|a| a == "--otlp")
+        || std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").is_some();
+    let otel = if otlp_enabled {
+        match otel::OtelExporter::new(otlp_endpoint.as_deref(), &hostname, interval) {
+            Ok(e) => {
+                info!("OTLP metrics export enabled");
+                Some(e)
+            }
+            Err(e) => {
+                warn!("OTLP exporter init failed: {e} — continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     loop {
         let snapshot = collector.collect(last_health.elapsed() >= health_interval);
+        if let Some(o) = &otel {
+            o.record(&snapshot);
+        }
 
         if last_health.elapsed() >= health_interval {
             last_health = tokio::time::Instant::now();

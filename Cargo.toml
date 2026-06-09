@@ -21,3 +21,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pcap = "2"
+# OTLP metrics export (single-host, standards-native). HTTP/protobuf transport
+# only — no gRPC/tonic — to keep the agent lean.
+opentelemetry = { version = "0.27", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
