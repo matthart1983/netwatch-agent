@@ -4,6 +4,10 @@ use std::collections::VecDeque;
 
 const MAX_BUFFER: usize = 100;
 
+/// Ingest envelope schema version. Matches netwatch's built-in `netwatch daemon`
+/// (v0.25.6+) and the value netwatch-cloud Core records in the `hosts` table.
+const SCHEMA_VERSION: u32 = 1;
+
 // v0.2.0 compatibility:
 // - Server returns 207 Multi-Status for partial success (some snapshots accepted, some rejected)
 // - Server returns 402 Payment Required for billing limits (account over host limit or trial expired)
@@ -11,12 +15,34 @@ const MAX_BUFFER: usize = 100;
 // - Server validates timestamp is within ±24h of server time
 // - Server enforces host limits based on billing plan (reflected in 402)
 
+/// Wire envelope POSTed to netwatch-cloud `/api/v1/ingest`: the `IngestRequest`
+/// fields flattened at the top level, plus `schema_version` and `agent_health`,
+/// so the standalone agent reports liveness/backlog the same way netwatch's
+/// built-in daemon does (Core stores these on the `hosts` row).
+#[derive(serde::Serialize)]
+struct IngestEnvelope<'a> {
+    schema_version: u32,
+    #[serde(flatten)]
+    request: &'a IngestRequest,
+    agent_health: AgentHealth,
+}
+
+#[derive(serde::Serialize)]
+struct AgentHealth {
+    collectors_ok: bool,
+    dropped_count: u64,
+    queue_depth: u64,
+}
+
 pub struct Sender {
     endpoint: String,
     api_key: String,
     host_info: HostInfo,
     buffer: VecDeque<Snapshot>,
     consecutive_failures: u32,
+    /// Snapshots discarded because the retry buffer overflowed `MAX_BUFFER`.
+    /// Reported in `agent_health.dropped_count`.
+    dropped_count: u64,
 }
 
 impl Sender {
@@ -27,6 +53,7 @@ impl Sender {
             host_info,
             buffer: VecDeque::new(),
             consecutive_failures: 0,
+            dropped_count: 0,
         }
     }
 
@@ -39,17 +66,31 @@ impl Sender {
 
         // Drain buffer into a single request
         let snapshots: Vec<Snapshot> = self.buffer.drain(..).collect();
+        // Backlog being flushed in this batch (1 when healthy, higher once
+        // sends have been failing and snapshots have queued up).
+        let queue_depth = snapshots.len() as u64;
 
         let request = IngestRequest {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             host: self.host_info.clone(),
             snapshots: snapshots.clone(),
         };
+        let envelope = IngestEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request: &request,
+            agent_health: AgentHealth {
+                // The agent collects inline (no panicking collector threads like
+                // the daemon), so it's healthy whenever it's alive to send.
+                collectors_ok: true,
+                dropped_count: self.dropped_count,
+                queue_depth,
+            },
+        };
 
         let result = ureq::post(&self.endpoint)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
-            .send_json(serde_json::to_value(&request).map_err(|e| e.to_string())?);
+            .send_json(serde_json::to_value(&envelope).map_err(|e| e.to_string())?);
 
         match result {
             Ok(response) => {
@@ -69,7 +110,9 @@ impl Sender {
                                         tracing::info!(
                                             "Ingest partial success: {}/{} snapshots accepted",
                                             ingest_response.accepted,
-                                            ingest_response.rejected.saturating_add(ingest_response.accepted)
+                                            ingest_response
+                                                .rejected
+                                                .saturating_add(ingest_response.accepted)
                                         );
 
                                         // Log any rejection details
@@ -77,7 +120,9 @@ impl Sender {
                                             if result.status != 200 {
                                                 tracing::warn!(
                                                     "Snapshot {} rejected with status {}: {}",
-                                                    result.index, result.status, result.message
+                                                    result.index,
+                                                    result.status,
+                                                    result.message
                                                 );
                                             }
                                         }
@@ -87,10 +132,7 @@ impl Sender {
                                         Ok(())
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to parse 207 response: {}",
-                                            e
-                                        );
+                                        tracing::warn!("Failed to parse 207 response: {}", e);
                                         // Still count as partial success since we got 207
                                         self.consecutive_failures = 0;
                                         Ok(())
@@ -147,10 +189,7 @@ impl Sender {
                         }
                         self.trim_buffer();
                         self.consecutive_failures += 1;
-                        tracing::warn!(
-                            "Server error {} - will retry",
-                            response.status()
-                        );
+                        tracing::warn!("Server error {} - will retry", response.status());
                         Err(format!("Server error {}", response.status()))
                     }
                     status => {
@@ -181,6 +220,54 @@ impl Sender {
     fn trim_buffer(&mut self) {
         while self.buffer.len() > MAX_BUFFER {
             self.buffer.pop_front();
+            self.dropped_count += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netwatch_sdk::types::HostInfo;
+
+    #[test]
+    fn envelope_carries_schema_version_and_agent_health() {
+        let request = IngestRequest {
+            agent_version: "0.4.0".into(),
+            host: HostInfo {
+                host_id: uuid::Uuid::nil(),
+                hostname: "edge-1".into(),
+                os: None,
+                kernel: None,
+                uptime_secs: None,
+                cpu_model: None,
+                cpu_cores: None,
+                memory_total_bytes: None,
+            },
+            snapshots: vec![],
+        };
+        let envelope = IngestEnvelope {
+            schema_version: SCHEMA_VERSION,
+            request: &request,
+            agent_health: AgentHealth {
+                collectors_ok: true,
+                dropped_count: 3,
+                queue_depth: 2,
+            },
+        };
+        let v = serde_json::to_value(&envelope).unwrap();
+
+        // schema_version + agent_health present; IngestRequest fields flattened
+        // to the top level — exactly the shape Core's IngestEnvelope expects.
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["agent_version"], "0.4.0");
+        assert!(v["host"].is_object(), "host flattened to top level");
+        assert!(
+            v["snapshots"].is_array(),
+            "snapshots flattened to top level"
+        );
+        assert_eq!(v["agent_health"]["collectors_ok"], true);
+        assert_eq!(v["agent_health"]["dropped_count"], 3);
+        assert_eq!(v["agent_health"]["queue_depth"], 2);
     }
 }
