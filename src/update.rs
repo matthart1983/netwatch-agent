@@ -3,7 +3,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-const REPO: &str = "matthart1983/netwatch-cloud";
+// Releases live on this (public) repo — unauthenticated `curl` can't reach
+// assets on the private netwatch-cloud repo, which silently broke self-update.
+const REPO: &str = "matthart1983/netwatch-agent";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn self_update() -> Result<()> {

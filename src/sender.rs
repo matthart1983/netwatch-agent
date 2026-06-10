@@ -204,8 +204,25 @@ impl Sender {
                     }
                 }
             }
+            // ureq surfaces every non-2xx as Error::Status, so 4xx/5xx arrive
+            // here, not in the Ok arms above. Auth rejections can't succeed by
+            // retrying — pulse once per interval instead of hammering the
+            // endpoint with backoff retries. Snapshots stay buffered (bounded)
+            // so nothing is lost if the key is fixed and the agent restarted.
+            Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+                for s in snapshots.into_iter().rev() {
+                    self.buffer.push_front(s);
+                }
+                self.trim_buffer();
+                self.consecutive_failures += 1;
+                tracing::error!(
+                    "API key rejected ({}). Run 'netwatch-agent setup' or set NETWATCH_API_KEY.",
+                    code
+                );
+                Err(format!("API key rejected ({})", code))
+            }
             Err(e) => {
-                // Network error - put snapshots back in buffer
+                // Transport failure or other HTTP status - put snapshots back in buffer
                 for s in snapshots.into_iter().rev() {
                     self.buffer.push_front(s);
                 }

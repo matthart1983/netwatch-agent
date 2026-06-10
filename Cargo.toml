@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-agent"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Lightweight agent for NetWatch Cloud — collects network, system, and process metrics on Linux and macOS hosts and POSTs them to the hosted SaaS backend."
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/matthart1983/netwatch-agent"
 readme = "README.md"
 
 [dependencies]
-netwatch-sdk = { git = "https://github.com/matthart1983/netwatch-sdk.git", branch = "main" }
+netwatch-sdk = "0.3.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

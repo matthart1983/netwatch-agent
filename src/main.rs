@@ -139,8 +139,14 @@ async fn main() -> Result<()> {
                     info!("snapshot sent");
                     send_succeeded = true;
                 }
-                Err(e) if e.contains("402") || e.contains("Single") || e.contains("billing") => {
+                Err(e)
+                    if e.contains("402")
+                        || e.contains("API key rejected")
+                        || e.contains("Single")
+                        || e.contains("billing") =>
+                {
                     // 402: Account over limit / billing issue - don't retry
+                    // 401/403: bad or revoked API key - retry next interval, not in this loop
                     // 413 Single: Single snapshot too large - don't retry
                     warn!("Unrecoverable error: {}", e);
                     send_succeeded = true; // Exit retry loop

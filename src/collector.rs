@@ -2,7 +2,8 @@ use crate::config::AgentConfig;
 use chrono::Utc;
 use netwatch_sdk::collectors::network_intel::{InterfaceRateEvent, NetworkIntelCollector};
 use netwatch_sdk::collectors::{
-    config as net_config, connections, disk, health, process_bandwidth, system, traffic,
+    config as net_config, connections, disk, health, proc_meta, process_bandwidth, system,
+    traffic,
 };
 use netwatch_sdk::types::{HealthMetric, InterfaceMetric, Snapshot, SystemMetric};
 use std::sync::{Arc, Mutex};
@@ -124,9 +125,17 @@ impl MetricsCollector {
         let processes = {
             // Real per-process bandwidth measured from per-socket byte deltas
             // (see ProcessBandwidthTracker), not the old proportional split.
-            let ranked = self
+            let mut ranked = self
                 .proc_bw_tracker
                 .sample(&raw_connections, MAX_PROCESSES_PER_SNAPSHOT);
+            // Identity/resource detail (user, cpu%, mem, state, started, exe
+            // path) from one ps sample. Best-effort: a failed ps leaves the
+            // rows network-only, which the backend treats like a v1 agent.
+            if !ranked.is_empty() {
+                if let Some(meta) = proc_meta::sample() {
+                    proc_meta::apply(&mut ranked, &meta);
+                }
+            }
             if ranked.is_empty() {
                 None
             } else {
