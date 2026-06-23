@@ -26,6 +26,12 @@ pub struct AgentConfig {
     pub bandwidth_alert_bytes_per_sec: Option<u64>,
     #[serde(default)]
     pub packet_capture: PacketCaptureConfig,
+    /// Local opt-in for cloud-initiated DPI metadata capture. OFF by default.
+    /// When false the agent never dials the DPI uplink, so the cloud cannot
+    /// start a capture on this host — even a compromised control plane can't
+    /// (DPI security review #19: the load-bearing control is this local flag).
+    #[serde(default)]
+    pub dpi_remote_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -62,6 +68,7 @@ impl Default for AgentConfig {
             dns_server: None,
             bandwidth_alert_bytes_per_sec: None,
             packet_capture: PacketCaptureConfig::default(),
+            dpi_remote_enabled: false,
         }
     }
 }
@@ -71,10 +78,26 @@ impl AgentConfig {
         std::env::var("NETWATCH_CONFIG").unwrap_or_else(|_| default_config_path())
     }
 
+    /// Derive the DPI uplink WS URL from the ingest `endpoint` so it always
+    /// tracks the same host/environment (prod vs staging). Strips the
+    /// `/api/v1/ingest` suffix, swaps the scheme to ws(s), and appends the
+    /// uplink path.
+    pub fn dpi_uplink_url(&self) -> String {
+        let base = self
+            .endpoint
+            .strip_suffix("/api/v1/ingest")
+            .unwrap_or(&self.endpoint)
+            .trim_end_matches('/');
+        let ws = base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        format!("{ws}/api/v1/agent/dpi/uplink")
+    }
+
     pub fn load() -> Result<Self> {
         // Environment variables take precedence
-        let config_path = std::env::var("NETWATCH_CONFIG")
-            .unwrap_or_else(|_| default_config_path());
+        let config_path =
+            std::env::var("NETWATCH_CONFIG").unwrap_or_else(|_| default_config_path());
 
         let mut cfg: AgentConfig = if let Ok(contents) = fs::read_to_string(&config_path) {
             toml::from_str(&contents)
@@ -94,6 +117,9 @@ impl AgentConfig {
             if let Ok(n) = v.parse() {
                 cfg.interval_secs = n;
             }
+        }
+        if let Ok(v) = std::env::var("NETWATCH_DPI_REMOTE") {
+            cfg.dpi_remote_enabled = matches!(v.as_str(), "1" | "true" | "yes");
         }
 
         // Validate

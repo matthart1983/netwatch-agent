@@ -5,6 +5,7 @@ use tracing::{info, warn};
 mod capture;
 mod collector;
 mod config;
+mod dpi_uplink;
 mod host;
 mod otel;
 mod sender;
@@ -15,7 +16,7 @@ const GIT_HASH: &str = env!("GIT_HASH");
 
 // v0.2.0 compatibility:
 // Exponential backoff configuration for retrying failed sends
-const BASE_RETRY_DELAY: u64 = 5;  // 5 seconds
+const BASE_RETRY_DELAY: u64 = 5; // 5 seconds
 const MAX_RETRY_DELAY: u64 = 300; // 5 minutes
 
 #[tokio::main]
@@ -65,8 +66,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_target(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -74,18 +74,44 @@ async fn main() -> Result<()> {
     let host_id = host::get_or_create_host_id()?;
     let host_info = host::collect_host_info(host_id);
 
-    info!("netwatch-agent started, version {} ({}), host_id={}", VERSION, GIT_HASH, host_id);
+    info!(
+        "netwatch-agent started, version {} ({}), host_id={}",
+        VERSION, GIT_HASH, host_id
+    );
     info!("endpoint: {}", cfg.endpoint);
-    info!("interval: {}s, health interval: {}s", cfg.interval_secs, cfg.health_interval_secs);
+    info!(
+        "interval: {}s, health interval: {}s",
+        cfg.interval_secs, cfg.health_interval_secs
+    );
 
     let mut collector = collector::MetricsCollector::new(&cfg);
     let hostname = host_info.hostname.clone();
     let mut sender = sender::Sender::new(&cfg, host_info);
 
     if cfg.packet_capture.enabled {
-        capture::spawn(cfg.packet_capture.interface.clone(), collector.intel_handle());
+        capture::spawn(
+            cfg.packet_capture.interface.clone(),
+            collector.intel_handle(),
+        );
     } else {
         info!("packet capture disabled (set packet_capture.enabled = true in config to enable)");
+    }
+
+    // Outbound DPI metadata uplink — only when locally opted in (security
+    // review #19). The cloud cannot start a capture on a host that hasn't set
+    // dpi_remote_enabled = true. Runs as its own task so the blocking
+    // collect/send loop below can't starve it.
+    if cfg.dpi_remote_enabled {
+        let url = cfg.dpi_uplink_url();
+        let key = cfg.api_key.clone();
+        let iface = cfg.packet_capture.interface.clone();
+        let agent_version = format!("{VERSION} ({GIT_HASH})");
+        info!("DPI remote metadata uplink enabled → {}", url);
+        tokio::spawn(async move {
+            dpi_uplink::run(url, key, host_id, iface, agent_version).await;
+        });
+    } else {
+        info!("DPI remote uplink disabled (set dpi_remote_enabled = true to allow cloud-initiated metadata capture)");
     }
 
     let interval = Duration::from_secs(cfg.interval_secs);
@@ -132,7 +158,7 @@ async fn main() -> Result<()> {
         // v0.2.0: Retry with exponential backoff on transient failures
         let mut retry_delay = BASE_RETRY_DELAY;
         let mut send_succeeded = false;
-        
+
         while !send_succeeded {
             match sender.send(snapshot.clone()) {
                 Ok(()) => {
@@ -153,8 +179,12 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     // Transient errors: network, 5xx, or 413 batch - retry with backoff
-                    warn!("Send failed, retrying in {}s: {} (buffered: {} queued)", 
-                          retry_delay, e, sender.buffer_len());
+                    warn!(
+                        "Send failed, retrying in {}s: {} (buffered: {} queued)",
+                        retry_delay,
+                        e,
+                        sender.buffer_len()
+                    );
                     tokio::time::sleep(Duration::from_secs(retry_delay)).await;
                     retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
                 }
@@ -203,7 +233,11 @@ fn run_setup() -> Result<()> {
     let mut endpoint = String::new();
     io::stdin().lock().read_line(&mut endpoint)?;
     let endpoint = endpoint.trim();
-    let endpoint = if endpoint.is_empty() { default_endpoint } else { endpoint };
+    let endpoint = if endpoint.is_empty() {
+        default_endpoint
+    } else {
+        endpoint
+    };
 
     // Write config
     if let Some(parent) = std::path::Path::new(&config_path).parent() {
@@ -252,7 +286,9 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  netwatch-agent             Run the agent daemon");
-    println!("  netwatch-agent setup       Interactive first-run setup (writes config, starts agent)");
+    println!(
+        "  netwatch-agent setup       Interactive first-run setup (writes config, starts agent)"
+    );
     println!("  netwatch-agent update      Download and install the latest version");
     println!("  netwatch-agent status      Show agent status");
     println!("  netwatch-agent config      Show current configuration");
@@ -277,7 +313,9 @@ fn print_status() -> Result<()> {
             .output();
 
         match output {
-            Ok(o) if o.status.success() => println!("Status: ✅ launchd service loaded ({})", label),
+            Ok(o) if o.status.success() => {
+                println!("Status: ✅ launchd service loaded ({})", label)
+            }
             Ok(_) => println!("Status: launchd service not loaded ({})", label),
             Err(_) => println!("Status: launchctl not available (running outside launchd?)"),
         }
@@ -285,7 +323,7 @@ fn print_status() -> Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
-    // Check if systemd service is running
+        // Check if systemd service is running
         let output = std::process::Command::new("systemctl")
             .args(["is-active", "netwatch-agent"])
             .output();
@@ -307,7 +345,9 @@ fn print_status() -> Result<()> {
 
     // Show host ID
     let host_id_path = if cfg!(target_os = "macos") {
-        std::env::var("HOME").map(|h| format!("{}/.config/netwatch-agent/host-id", h)).unwrap_or_else(|_| "/var/lib/netwatch-agent/host-id".to_string())
+        std::env::var("HOME")
+            .map(|h| format!("{}/.config/netwatch-agent/host-id", h))
+            .unwrap_or_else(|_| "/var/lib/netwatch-agent/host-id".to_string())
     } else {
         "/var/lib/netwatch-agent/host-id".to_string()
     };
@@ -338,7 +378,11 @@ fn install_launchd_agent() -> Result<()> {
 
     let exe = std::env::current_exe()?;
     let plist_path = launchd_plist_path()?;
-    let log_dir = plist_path.parent().and_then(|p| p.parent()).map(|p| p.join("Logs")).expect("launch agents parent");
+    let log_dir = plist_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("Logs"))
+        .expect("launch agents parent");
     fs::create_dir_all(plist_path.parent().expect("plist parent"))?;
     fs::create_dir_all(&log_dir)?;
 
@@ -428,7 +472,10 @@ fn remove_launchd_agent() -> Result<()> {
 fn print_config() -> Result<()> {
     let cfg = config::AgentConfig::load()?;
     println!("Endpoint:  {}", cfg.endpoint);
-    println!("API Key:   {}...", &cfg.api_key[..std::cmp::min(14, cfg.api_key.len())]);
+    println!(
+        "API Key:   {}...",
+        &cfg.api_key[..std::cmp::min(14, cfg.api_key.len())]
+    );
     println!("Interval:  {}s", cfg.interval_secs);
     println!("Health:    {}s", cfg.health_interval_secs);
     if !cfg.interfaces.is_empty() {

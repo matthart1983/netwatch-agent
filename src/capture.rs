@@ -28,11 +28,10 @@ const READ_TIMEOUT_MS: i32 = 500;
 
 /// Pick an interface to capture on. "auto" picks the pcap default device,
 /// which is typically the primary uplink.
-fn resolve_interface(name: &str) -> Result<Device, pcap::Error> {
+pub(crate) fn resolve_interface(name: &str) -> Result<Device, pcap::Error> {
     if name == "auto" {
-        return Device::lookup()?.ok_or_else(|| {
-            pcap::Error::PcapError("no default capture device available".into())
-        });
+        return Device::lookup()?
+            .ok_or_else(|| pcap::Error::PcapError("no default capture device available".into()));
     }
     let devices = Device::list()?;
     devices
@@ -82,7 +81,10 @@ fn run(interface: &str, intel: Arc<Mutex<NetworkIntelCollector>>) {
     let filter = "(tcp and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0) \
                   or (udp and port 53)";
     if let Err(e) = cap.filter(filter, true) {
-        tracing::warn!("packet capture disabled — failed to install BPF filter: {}", e);
+        tracing::warn!(
+            "packet capture disabled — failed to install BPF filter: {}",
+            e
+        );
         return;
     }
 
@@ -147,7 +149,7 @@ fn parse_event(frame: &[u8], linktype: Linktype) -> Option<Event> {
     }
 }
 
-fn parse_ethernet(frame: &[u8]) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
+pub(crate) fn parse_ethernet(frame: &[u8]) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
     if frame.len() < 14 {
         return None;
     }
@@ -163,7 +165,10 @@ fn parse_ethernet(frame: &[u8]) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
 /// host byte order; DLT_LOOP uses network byte order. We treat DLT_NULL as
 /// little-endian because every OS where we'd actually see DLT_NULL
 /// (macOS/Linux/FreeBSD) is little-endian.
-fn parse_bsd_loopback(frame: &[u8], network_byte_order: bool) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
+pub(crate) fn parse_bsd_loopback(
+    frame: &[u8],
+    network_byte_order: bool,
+) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
     if frame.len() < 4 {
         return None;
     }
@@ -173,7 +178,7 @@ fn parse_bsd_loopback(frame: &[u8], network_byte_order: bool) -> Option<(IpAddr,
         u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]])
     };
     match family {
-        2 => parse_ipv4(&frame[4..]),                 // AF_INET
+        2 => parse_ipv4(&frame[4..]), // AF_INET
         f if f == MACOS_AF_INET6 || f == 10 || f == 24 || f == 28 => parse_ipv6(&frame[4..]),
         _ => None,
     }
@@ -242,13 +247,7 @@ fn parse_udp(src: IpAddr, dst: IpAddr, buf: &[u8]) -> Option<Event> {
     parse_dns(src, dst, src_port, dst_port, payload)
 }
 
-fn parse_dns(
-    src: IpAddr,
-    dst: IpAddr,
-    src_port: u16,
-    dst_port: u16,
-    buf: &[u8],
-) -> Option<Event> {
+fn parse_dns(src: IpAddr, dst: IpAddr, src_port: u16, dst_port: u16, buf: &[u8]) -> Option<Event> {
     if buf.len() < 12 {
         return None;
     }
@@ -341,14 +340,14 @@ mod tests {
         // IPv4: version=4, IHL=5
         frame[14] = 0x45;
         frame[23] = 6; // proto = TCP
-        // src = 10.0.0.1
+                       // src = 10.0.0.1
         frame[26..30].copy_from_slice(&[10, 0, 0, 1]);
         // dst = 10.0.0.2
         frame[30..34].copy_from_slice(&[10, 0, 0, 2]);
         // TCP: dst port = 443 at IP+2..IP+4
         frame[14 + 20 + 2] = 0x01;
         frame[14 + 20 + 3] = 0xbb; // 443
-        // Data offset = 5 (20 bytes) at IP+12 high nibble
+                                   // Data offset = 5 (20 bytes) at IP+12 high nibble
         frame[14 + 20 + 12] = 0x50;
         // Flags: SYN only at IP+13
         frame[14 + 20 + 13] = 0x02;

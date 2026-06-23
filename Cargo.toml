@@ -10,7 +10,14 @@ readme = "README.md"
 
 [dependencies]
 netwatch-sdk = "0.3.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+# Shared metadata-only DPI building blocks (classifier + source-side redactor).
+# NOTE: path dep for now — must be published to crates.io (like netwatch-sdk was)
+# before the agent is released publicly; fine for local/staging builds.
+netwatch-dpi = { path = "../netwatch-dpi" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "net", "sync", "io-util"] }
+# WebSocket client for the outbound DPI metadata uplink (rustls — no system openssl).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
