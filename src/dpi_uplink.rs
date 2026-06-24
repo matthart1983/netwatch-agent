@@ -70,6 +70,44 @@ struct Packet {
     flow: String,
     app: String,
     anomaly: Option<String>,
+    /// Protocol-header decode tree (Frame/Eth/IP/TCP/UDP + L7 identification).
+    /// Header fields only — NEVER application payload bodies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    decode: Vec<DecodeNode>,
+    /// Header-region hex (L2–L4 bytes only, no payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hex: Option<HexDump>,
+}
+
+/// A node in the protocol decode tree; mirrors the dashboard's `DecodeNode`.
+/// `span` is the byte range of this field in the header hex (drives highlight).
+#[derive(Serialize, Clone)]
+struct DecodeNode {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span: Option<[u32; 2]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<DecodeNode>,
+}
+
+impl DecodeNode {
+    fn leaf(label: &str, value: String) -> Self {
+        Self { label: label.into(), value: Some(value), span: None, children: Vec::new() }
+    }
+    fn leaf_span(label: &str, value: String, span: [u32; 2]) -> Self {
+        Self { label: label.into(), value: Some(value), span: Some(span), children: Vec::new() }
+    }
+    fn node(label: &str, value: Option<String>, span: Option<[u32; 2]>, children: Vec<DecodeNode>) -> Self {
+        Self { label: label.into(), value, span, children }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct HexDump {
+    bytes: Vec<u8>,
+    highlight: Option<[u32; 2]>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -460,6 +498,9 @@ fn build_packet(
     let meta = classify_meta(payload, is_tcp, sport, dport);
     let (proto_label, app, info) = label(meta.as_ref(), is_tcp, &flags, on_wire, redactor);
 
+    // Protocol-header decode tree (+ header-only hex). Header fields only.
+    let (decode, hex) = build_decode(frame, linktype, meta.as_ref(), redactor);
+
     // Direction-independent flow id.
     let key = if src <= dst {
         (src.clone(), dst.clone())
@@ -483,6 +524,8 @@ fn build_packet(
         flow: format!("F{flow_id}"),
         app,
         anomaly: None,
+        decode,
+        hex,
     })
 }
 
@@ -544,6 +587,246 @@ fn label(
             "SSH".into(),
         ),
     }
+}
+
+/// Build the protocol-HEADER decode tree (+ header-only hex) from the raw frame.
+/// Emits only L2–L4 header fields (real, parsed from bytes) plus L7
+/// *identification* values from the classifier (SNI/Host/method/qname — never
+/// bodies/paths). The hex is the header region only (no application payload).
+/// Bounds-checked: returns a partial tree if the frame is truncated.
+fn build_decode(
+    frame: &[u8],
+    linktype: Linktype,
+    meta: Option<&ClassifiedMeta>,
+    r: &Redactor,
+) -> (Vec<DecodeNode>, Option<HexDump>) {
+    let mut tree = vec![DecodeNode::leaf("Frame", format!("{} bytes on wire", frame.len()))];
+
+    // ── L2 ──
+    let l2_len: usize = match linktype {
+        Linktype::ETHERNET => {
+            if frame.len() < 14 {
+                return (tree, None);
+            }
+            let mac = |o: usize| {
+                frame[o..o + 6].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+            };
+            let etype = u16::from_be_bytes([frame[12], frame[13]]);
+            tree.push(DecodeNode::node(
+                "Ethernet II",
+                None,
+                Some([0, 14]),
+                vec![
+                    DecodeNode::leaf_span("Destination", mac(0), [0, 6]),
+                    DecodeNode::leaf_span("Source", mac(6), [6, 12]),
+                    DecodeNode::leaf_span("Type", format!("0x{etype:04x}"), [12, 14]),
+                ],
+            ));
+            14
+        }
+        Linktype::NULL | Linktype::LOOP => {
+            if frame.len() < 4 {
+                return (tree, None);
+            }
+            let fam = u32::from_ne_bytes([frame[0], frame[1], frame[2], frame[3]]);
+            tree.push(DecodeNode::node(
+                "Loopback",
+                None,
+                Some([0, 4]),
+                vec![DecodeNode::leaf_span("Address family", format!("{fam}"), [0, 4])],
+            ));
+            4
+        }
+        _ => return (tree, None),
+    };
+
+    // ── L3 ──
+    if frame.len() <= l2_len {
+        return (tree, None);
+    }
+    let l2 = l2_len as u32;
+    let (l4_proto, l4_off) = match frame[l2_len] >> 4 {
+        4 => {
+            if frame.len() < l2_len + 20 {
+                return (tree, None);
+            }
+            let ihl = ((frame[l2_len] & 0x0f) as usize) * 4;
+            if ihl < 20 || frame.len() < l2_len + ihl {
+                return (tree, None);
+            }
+            let ttl = frame[l2_len + 8];
+            let proto = frame[l2_len + 9];
+            let cks = u16::from_be_bytes([frame[l2_len + 10], frame[l2_len + 11]]);
+            let src = std::net::Ipv4Addr::new(frame[l2_len + 12], frame[l2_len + 13], frame[l2_len + 14], frame[l2_len + 15]);
+            let dst = std::net::Ipv4Addr::new(frame[l2_len + 16], frame[l2_len + 17], frame[l2_len + 18], frame[l2_len + 19]);
+            tree.push(DecodeNode::node(
+                "Internet Protocol v4",
+                Some(format!("{src} → {dst}")),
+                Some([l2, l2 + ihl as u32]),
+                vec![
+                    DecodeNode::leaf_span("Version / IHL", format!("4 / {ihl} bytes"), [l2, l2 + 1]),
+                    DecodeNode::leaf_span("TTL", format!("{ttl}"), [l2 + 8, l2 + 9]),
+                    DecodeNode::leaf_span("Protocol", proto_name(proto), [l2 + 9, l2 + 10]),
+                    DecodeNode::leaf_span("Header checksum", format!("0x{cks:04x}"), [l2 + 10, l2 + 12]),
+                    DecodeNode::leaf_span("Source", src.to_string(), [l2 + 12, l2 + 16]),
+                    DecodeNode::leaf_span("Destination", dst.to_string(), [l2 + 16, l2 + 20]),
+                ],
+            ));
+            (proto, l2_len + ihl)
+        }
+        6 => {
+            if frame.len() < l2_len + 40 {
+                return (tree, None);
+            }
+            let nh = frame[l2_len + 6];
+            let hop = frame[l2_len + 7];
+            let src = ipv6_at(frame, l2_len + 8);
+            let dst = ipv6_at(frame, l2_len + 24);
+            tree.push(DecodeNode::node(
+                "Internet Protocol v6",
+                Some(format!("{src} → {dst}")),
+                Some([l2, l2 + 40]),
+                vec![
+                    DecodeNode::leaf_span("Next header", proto_name(nh), [l2 + 6, l2 + 7]),
+                    DecodeNode::leaf_span("Hop limit", format!("{hop}"), [l2 + 7, l2 + 8]),
+                    DecodeNode::leaf_span("Source", src.to_string(), [l2 + 8, l2 + 24]),
+                    DecodeNode::leaf_span("Destination", dst.to_string(), [l2 + 24, l2 + 40]),
+                ],
+            ));
+            (nh, l2_len + 40)
+        }
+        _ => return (tree, None),
+    };
+
+    // ── L4 ──
+    let o = l4_off as u32;
+    let l7_off = if l4_proto == 6 && frame.len() >= l4_off + 20 {
+        let sport = u16::from_be_bytes([frame[l4_off], frame[l4_off + 1]]);
+        let dport = u16::from_be_bytes([frame[l4_off + 2], frame[l4_off + 3]]);
+        let seq = u32::from_be_bytes([frame[l4_off + 4], frame[l4_off + 5], frame[l4_off + 6], frame[l4_off + 7]]);
+        let ack = u32::from_be_bytes([frame[l4_off + 8], frame[l4_off + 9], frame[l4_off + 10], frame[l4_off + 11]]);
+        let doff = (((frame[l4_off + 12] >> 4) as usize) * 4).max(20);
+        let fl = frame[l4_off + 13];
+        let win = u16::from_be_bytes([frame[l4_off + 14], frame[l4_off + 15]]);
+        tree.push(DecodeNode::node(
+            "Transmission Control Protocol",
+            Some(format!("{sport} → {dport}")),
+            Some([o, o + doff as u32]),
+            vec![
+                DecodeNode::leaf_span("Source Port", format!("{sport}"), [o, o + 2]),
+                DecodeNode::leaf_span("Destination Port", format!("{dport}"), [o + 2, o + 4]),
+                DecodeNode::leaf_span("Sequence", format!("{seq}"), [o + 4, o + 8]),
+                DecodeNode::leaf_span("Acknowledgment", format!("{ack}"), [o + 8, o + 12]),
+                DecodeNode::node(
+                    "Flags",
+                    Some(format!("0x{fl:02x}")),
+                    Some([o + 13, o + 14]),
+                    vec![
+                        DecodeNode::leaf("SYN", yn(fl & 0x02 != 0)),
+                        DecodeNode::leaf("ACK", yn(fl & 0x10 != 0)),
+                        DecodeNode::leaf("PSH", yn(fl & 0x08 != 0)),
+                        DecodeNode::leaf("FIN", yn(fl & 0x01 != 0)),
+                        DecodeNode::leaf("RST", yn(fl & 0x04 != 0)),
+                    ],
+                ),
+                DecodeNode::leaf_span("Window", format!("{win}"), [o + 14, o + 16]),
+            ],
+        ));
+        l4_off + doff
+    } else if l4_proto == 17 && frame.len() >= l4_off + 8 {
+        let sport = u16::from_be_bytes([frame[l4_off], frame[l4_off + 1]]);
+        let dport = u16::from_be_bytes([frame[l4_off + 2], frame[l4_off + 3]]);
+        let ulen = u16::from_be_bytes([frame[l4_off + 4], frame[l4_off + 5]]);
+        tree.push(DecodeNode::node(
+            "User Datagram Protocol",
+            Some(format!("{sport} → {dport}")),
+            Some([o, o + 8]),
+            vec![
+                DecodeNode::leaf_span("Source Port", format!("{sport}"), [o, o + 2]),
+                DecodeNode::leaf_span("Destination Port", format!("{dport}"), [o + 2, o + 4]),
+                DecodeNode::leaf_span("Length", format!("{ulen}"), [o + 4, o + 6]),
+            ],
+        ));
+        l4_off + 8
+    } else {
+        l4_off
+    };
+
+    // ── L7 identification (values only, redactor-backstopped; no bodies/paths) ──
+    let rd = |s: &str| r.redact_text(s).into_owned();
+    if let Some(m) = meta {
+        match &m.app {
+            AppProtocol::Tls { sni, alpn, ja4, .. } => {
+                let mut ch = Vec::new();
+                if let Some(s) = sni {
+                    ch.push(DecodeNode::leaf("Server Name (SNI)", rd(s)));
+                }
+                if let Some(a) = alpn {
+                    ch.push(DecodeNode::leaf("ALPN", rd(a)));
+                }
+                if let Some(j) = ja4 {
+                    ch.push(DecodeNode::leaf("JA4", rd(j)));
+                }
+                tree.push(DecodeNode::node("Transport Layer Security", Some("ClientHello".into()), None, ch));
+            }
+            AppProtocol::Http { method, host, status } => {
+                let mut ch = vec![DecodeNode::leaf("Method", rd(method))];
+                if let Some(h) = host {
+                    ch.push(DecodeNode::leaf("Host", rd(h)));
+                }
+                if let Some(s) = status {
+                    ch.push(DecodeNode::leaf("Status", format!("{s}")));
+                }
+                tree.push(DecodeNode::node("Hypertext Transfer Protocol", None, None, ch));
+            }
+            AppProtocol::Dns { qname, qtype } => {
+                tree.push(DecodeNode::node(
+                    "Domain Name System",
+                    None,
+                    None,
+                    vec![
+                        DecodeNode::leaf("Query Name", rd(qname)),
+                        DecodeNode::leaf("Query Type", format!("{qtype}")),
+                    ],
+                ));
+            }
+            AppProtocol::Ssh { version } => {
+                tree.push(DecodeNode::node("SSH", Some(rd(version)), None, Vec::new()));
+            }
+        }
+    }
+
+    // Header-only hex: L2–L4 bytes (NO application payload), capped at 128 bytes.
+    let end = l7_off.min(frame.len()).min(128);
+    let hex = HexDump {
+        bytes: frame[..end].to_vec(),
+        highlight: Some([(l4_off.min(end)) as u32, (l7_off.min(end)) as u32]),
+    };
+    (tree, Some(hex))
+}
+
+fn proto_name(p: u8) -> String {
+    match p {
+        1 => "ICMP (1)".into(),
+        6 => "TCP (6)".into(),
+        17 => "UDP (17)".into(),
+        58 => "ICMPv6 (58)".into(),
+        other => format!("{other}"),
+    }
+}
+
+fn yn(b: bool) -> String {
+    if b {
+        "Set".into()
+    } else {
+        "·".into()
+    }
+}
+
+fn ipv6_at(frame: &[u8], off: usize) -> std::net::Ipv6Addr {
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&frame[off..off + 16]);
+    std::net::Ipv6Addr::from(b)
 }
 
 fn parse_tcp_meta(buf: &[u8]) -> Option<(u16, u16, String, &[u8])> {
