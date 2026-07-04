@@ -121,6 +121,14 @@ impl AgentConfig {
         if let Ok(v) = std::env::var("NETWATCH_DPI_REMOTE") {
             cfg.dpi_remote_enabled = matches!(v.as_str(), "1" | "true" | "yes");
         }
+        if let Ok(v) = std::env::var("NETWATCH_PACKET_CAPTURE") {
+            cfg.packet_capture.enabled = matches!(v.as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = std::env::var("NETWATCH_CAPTURE_INTERFACE") {
+            if !v.trim().is_empty() {
+                cfg.packet_capture.interface = v;
+            }
+        }
 
         // Validate
         if cfg.api_key.is_empty() {
