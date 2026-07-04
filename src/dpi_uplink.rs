@@ -27,13 +27,14 @@
 //! TLS + the api key on the uplink and gated by the local opt-in, but are not
 //! yet cryptographically signed per-command. Tracked for a later pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use netwatch_dpi::{classify_meta, AppProtocol, ClassifiedMeta, Redactor};
+use netwatch_dpi::{classify_meta, extract_dns_answers, AppProtocol, ClassifiedMeta, Redactor};
 use pcap::{Capture, Linktype};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -136,6 +137,14 @@ enum UplinkMsg {
     },
     Stats {
         stats: CaptureStats,
+    },
+    /// IP → hostname labels for the ledger/decode. `source` is "dns" (learned
+    /// passively from observed DNS answers — authoritative) or "ptr" (reverse
+    /// lookup for an address never seen in a query). Names are redacted at
+    /// source like every other identifier.
+    Names {
+        source: String,
+        names: HashMap<String, String>,
     },
     Status {
         capturing: bool,
@@ -380,6 +389,26 @@ fn run_capture(
     let mut last_flush = Instant::now();
     let mut last_stats = Instant::now();
 
+    // Name resolution. `names` is the authoritative passive map (IP → looked-up
+    // name, from observed DNS answers); `pending_names` buffers newly-learned
+    // labels to flush with the next batch; `ptr_queued` dedupes what we've handed
+    // to the reverse-DNS worker. The worker runs off this thread so a slow
+    // resolver can't stall capture; the bounded channel drops on overflow.
+    let mut names: HashMap<IpAddr, String> = HashMap::new();
+    let mut pending_names: HashMap<String, String> = HashMap::new();
+    let mut ptr_queued: HashSet<IpAddr> = HashSet::new();
+    let (ptr_tx, ptr_rx) = std::sync::mpsc::sync_channel::<IpAddr>(1024);
+    {
+        let tx = tx.clone();
+        let stop = stop.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("netwatch-dpi-ptr".into())
+            .spawn(move || ptr_resolver_loop(ptr_rx, tx, stop))
+        {
+            warn!("dpi ptr resolver spawn failed: {e}");
+        }
+    }
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -395,7 +424,7 @@ fn run_capture(
         match cap.next_packet() {
             Ok(packet) => {
                 let on_wire = packet.header.len;
-                if let Some(p) = build_packet(
+                if let Some(built) = build_packet(
                     packet.data,
                     linktype,
                     on_wire,
@@ -404,6 +433,7 @@ fn run_capture(
                     &redactor,
                     &start,
                 ) {
+                    let Built { packet: p, src_ip, dst_ip, dns_answers } = built;
                     total_n += 1;
                     total_bytes += on_wire as u64;
                     match p.proto.as_str() {
@@ -417,6 +447,24 @@ fn run_capture(
                     if p.flags.contains("RST") {
                         resets += 1;
                     }
+
+                    // Passive DNS wins: learn IP → looked-up name and stop any
+                    // pending reverse lookup for that address.
+                    for (name, ip) in dns_answers {
+                        let label = redactor.redact_text(&name).to_string();
+                        if names.get(&ip) != Some(&label) {
+                            names.insert(ip, label.clone());
+                            pending_names.insert(ip.to_string(), label);
+                            ptr_queued.insert(ip);
+                        }
+                    }
+                    // Reverse-DNS fallback for endpoints with no name yet.
+                    for ip in [src_ip, dst_ip] {
+                        if ptr_eligible(&ip) && !names.contains_key(&ip) && ptr_queued.insert(ip) {
+                            let _ = ptr_tx.try_send(ip);
+                        }
+                    }
+
                     batch.push(p);
                 }
             }
@@ -435,6 +483,15 @@ fn run_capture(
                 .is_err()
             {
                 break; // forwarder gone (connection closed)
+            }
+            if !pending_names.is_empty() {
+                let names = std::mem::take(&mut pending_names);
+                if tx
+                    .blocking_send(UplinkMsg::Names { source: "dns".into(), names })
+                    .is_err()
+                {
+                    break;
+                }
             }
             last_flush = Instant::now();
         }
@@ -461,8 +518,61 @@ fn run_capture(
     debug!("dpi capture thread exiting after {} packets", total_n);
 }
 
+/// Reverse-DNS worker. Resolves endpoint IPs the passive map never named, off
+/// the capture thread so a slow resolver can't stall capture. Dedupes, drops
+/// non-results (a PTR that just echoes the address), redacts, and emits one
+/// `Names` frame per resolved address. Exits when the capture thread drops the
+/// sender or the session stops.
+fn ptr_resolver_loop(
+    rx: std::sync::mpsc::Receiver<IpAddr>,
+    tx: mpsc::Sender<UplinkMsg>,
+    stop: Arc<AtomicBool>,
+) {
+    let redactor = Redactor::redacting();
+    let mut seen: HashSet<IpAddr> = HashSet::new();
+    while let Ok(ip) = rx.recv() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if !seen.insert(ip) {
+            continue;
+        }
+        let Ok(host) = dns_lookup::lookup_addr(&ip) else {
+            continue;
+        };
+        let host = host.trim();
+        if host.is_empty() || host == ip.to_string() {
+            continue; // no useful PTR record
+        }
+        let mut names = HashMap::new();
+        names.insert(ip.to_string(), redactor.redact_text(host).to_string());
+        if tx
+            .blocking_send(UplinkMsg::Names { source: "ptr".into(), names })
+            .is_err()
+        {
+            break; // uplink gone
+        }
+    }
+}
+
+/// Whether an address is worth a reverse lookup. Skips loopback, multicast, and
+/// the unspecified address — never meaningful endpoints.
+fn ptr_eligible(ip: &IpAddr) -> bool {
+    !(ip.is_loopback() || ip.is_multicast() || ip.is_unspecified())
+}
+
 /// Parse one frame down to METADATA ONLY and build a wire `Packet`. Returns
 /// `None` for frames we don't surface (non-IP, non-TCP/UDP, malformed).
+/// A built packet plus the side-channel the names layer needs: the endpoint
+/// addresses (to queue for reverse DNS) and any A/AAAA answers carried by a DNS
+/// response (to learn passively).
+struct Built {
+    packet: Packet,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    dns_answers: Vec<(String, IpAddr)>,
+}
+
 fn build_packet(
     frame: &[u8],
     linktype: Linktype,
@@ -471,7 +581,7 @@ fn build_packet(
     flows: &mut HashMap<(String, String), u32>,
     redactor: &Redactor,
     start: &Instant,
-) -> Option<Packet> {
+) -> Option<Built> {
     let (src_ip, dst_ip, proto, l4) = match linktype {
         Linktype::ETHERNET => capture::parse_ethernet(frame)?,
         Linktype::NULL => capture::parse_bsd_loopback(frame, false)?,
@@ -496,6 +606,15 @@ fn build_packet(
 
     // Classify to metadata only (the classifier cannot return bodies/paths).
     let meta = classify_meta(payload, is_tcp, sport, dport);
+
+    // Passive DNS: a DNS *response* carries the address(es) the looked-up name
+    // resolved to. Harvest them (empty for queries / non-DNS) so endpoint IPs
+    // can be labelled with the name that was requested.
+    let dns_answers = match meta.as_ref().map(|m| &m.app) {
+        Some(AppProtocol::Dns { .. }) => extract_dns_answers(payload),
+        _ => Vec::new(),
+    };
+
     let (proto_label, app, info) = label(meta.as_ref(), is_tcp, &flags, on_wire, redactor);
 
     // Protocol-header decode tree (+ header-only hex). Header fields only.
@@ -512,20 +631,25 @@ fn build_packet(
 
     *no += 1;
     let t = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000_000.0;
-    Some(Packet {
-        no: *no,
-        t,
-        src,
-        dst,
-        proto: proto_label,
-        len: on_wire,
-        flags,
-        info,
-        flow: format!("F{flow_id}"),
-        app,
-        anomaly: None,
-        decode,
-        hex,
+    Some(Built {
+        packet: Packet {
+            no: *no,
+            t,
+            src,
+            dst,
+            proto: proto_label,
+            len: on_wire,
+            flags,
+            info,
+            flow: format!("F{flow_id}"),
+            app,
+            anomaly: None,
+            decode,
+            hex,
+        },
+        src_ip,
+        dst_ip,
+        dns_answers,
     })
 }
 
