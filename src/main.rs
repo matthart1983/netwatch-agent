@@ -51,13 +51,10 @@ async fn main() -> Result<()> {
         Some("config") => {
             return print_config();
         }
-        Some(unknown) if unknown.starts_with('-') || !unknown.is_empty() => {
-            // Unknown commands starting with letters are errors
-            if !unknown.starts_with('-') {
-                eprintln!("Unknown command: {}", unknown);
-                eprintln!("Run 'netwatch-agent help' for usage");
-                std::process::exit(1);
-            }
+        Some(unknown) if !unknown.starts_with('-') && !unknown.is_empty() => {
+            eprintln!("Unknown command: {}", unknown);
+            eprintln!("Run 'netwatch-agent help' for usage");
+            std::process::exit(1);
         }
         _ => {}
     }

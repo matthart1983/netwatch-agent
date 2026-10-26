@@ -1,6 +1,6 @@
 # netwatch-agent
 
-Lightweight network and system monitoring agent for [NetWatch Cloud](https://netwatch.io). Runs on your Linux or macOS hosts, collects metrics every 15 seconds, and streams them to the hosted backend.
+Lightweight network and system monitoring agent for [NetWatch Cloud](https://www.netwatchlabs.com/cloud). Runs on your Linux or macOS hosts, collects metrics every 15 seconds, and streams them to the hosted backend.
 
 ## What it collects
 
@@ -58,7 +58,25 @@ enabled = false
 interface = "auto"
 ```
 
-Environment variable overrides: `NETWATCH_API_KEY`, `NETWATCH_ENDPOINT`, `NETWATCH_INTERVAL`, `NETWATCH_CONFIG`.
+Environment variable overrides: `NETWATCH_API_KEY`, `NETWATCH_ENDPOINT`, `NETWATCH_INTERVAL`, `NETWATCH_CONFIG`, `NETWATCH_PACKET_CAPTURE`, `NETWATCH_CAPTURE_INTERFACE`, `NETWATCH_DPI_REMOTE`.
+
+### Cloud live capture (v0.6.0)
+
+The capture client is included in the release binaries and disabled by default.
+Set `NETWATCH_DPI_REMOTE=1` in the service environment to permit Cloud-initiated
+metadata capture. Set `NETWATCH_CAPTURE_INTERFACE` to the physical interface
+when automatic device selection is unsuitable. Restart the agent after changes.
+The host must also be authorized for capture in Cloud. Existing API credentials
+and CAP_NET_RAW permissions are reused; the agent does not run as root.
+
+This is separate from `packet_capture.enabled`, which feeds the local detectors.
+Capture emits addressing, protocol identifiers, TLS SNI/ALPN/JA4, HTTP method/Host/
+status, DNS names and transport-header details. It does not export application
+bodies or HTTP paths. See [metadata limits](crates/netwatch-dpi/README.md) and the
+[Fedora restoration/rollback procedure](CAPTURE-RESTORATION.md).
+
+Linux release binaries include libpcap statically and require glibc 2.35 or newer.
+Source builds use the system libpcap. Alpine/musl systems require a separate build.
 
 ## Run
 

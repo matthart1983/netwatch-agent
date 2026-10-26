@@ -1,0 +1,4 @@
+TLS classifier, JA4 implementation and TLS test fixture adapted from
+https://github.com/matthart1983/netwatch at a93e1eea4793631fbb424804193460f4acae3c31.
+Copyright (c) 2025 Matt Hartley. MIT license; see LICENSE.
+HTTP/SSH metadata recognition follows the parsers in the same revision.

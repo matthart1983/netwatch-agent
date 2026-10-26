@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-agent"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Lightweight agent for NetWatch Cloud — collects network, system, and process metrics on Linux and macOS hosts and POSTs them to the hosted SaaS backend."
 license = "MIT"
@@ -10,10 +10,8 @@ readme = "README.md"
 
 [dependencies]
 netwatch-sdk = "0.4.1"   # 0.4.1 fixes a `DateTime - TimeDelta` overflow panic in proc_meta
-# Shared metadata-only DPI building blocks (classifier + source-side redactor).
-# NOTE: path dep for now — must be published to crates.io (like netwatch-sdk was)
-# before the agent is released publicly; fine for local/staging builds.
-netwatch-dpi = { path = "../netwatch-dpi" }
+# In-tree metadata-only classifier and source-side redaction.
+netwatch-dpi = { path = "crates/netwatch-dpi" }
 # Reverse-DNS (PTR) lookups for endpoint IPs the passive DNS map never named.
 dns-lookup = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "net", "sync", "io-util"] }
@@ -35,3 +33,11 @@ pcap = "2"
 opentelemetry = { version = "0.27", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+
+[workspace]
+members = ["crates/netwatch-dpi"]
+resolver = "2"

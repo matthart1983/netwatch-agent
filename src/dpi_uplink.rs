@@ -15,8 +15,8 @@
 //!   * METADATA ONLY: the classifier emits an addressing/identification
 //!     allowlist (5-tuple, proto/app, TLS SNI, HTTP method + Host, DNS qname).
 //!     It NEVER emits URL path/query, headers, cookies, bodies, or decrypted
-//!     plaintext. A short snaplen means full payloads aren't even copied off
-//!     the wire.
+//!     plaintext. Snaplen bounds local packet copies; payload bytes may be
+//!     inspected locally but are excluded from every emitted frame.
 //!   * REDACTION BACKSTOP: every free-text field is passed through the
 //!     `netwatch-dpi` Redactor before it leaves the host — defense in depth on
 //!     top of the allowlist.
@@ -34,7 +34,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use netwatch_dpi::{classify_meta, extract_dns_answers, AppProtocol, ClassifiedMeta, Redactor};
+use netwatch_dpi::{
+    classify_meta, dns_message, extract_dns_answers, AppProtocol, ClassifiedMeta, Redactor,
+};
 use pcap::{Capture, Linktype};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -50,7 +52,8 @@ const SNAPLEN_DPI: i32 = 2048; // enough for L7 id headers (SNI/Host); not full 
 const READ_TIMEOUT_MS: i32 = 250;
 const MAX_SESSION_SECS: u64 = 1800; // hard cap regardless of the cloud (#21)
 const BATCH_INTERVAL: Duration = Duration::from_millis(700);
-const MAX_BATCH: usize = 256;
+const MAX_BATCH: usize = 64;
+const MAX_RELAY_FRAME: usize = 512 * 1024;
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 const BASE_RETRY: u64 = 5;
@@ -95,13 +98,33 @@ struct DecodeNode {
 
 impl DecodeNode {
     fn leaf(label: &str, value: String) -> Self {
-        Self { label: label.into(), value: Some(value), span: None, children: Vec::new() }
+        Self {
+            label: label.into(),
+            value: Some(value),
+            span: None,
+            children: Vec::new(),
+        }
     }
     fn leaf_span(label: &str, value: String, span: [u32; 2]) -> Self {
-        Self { label: label.into(), value: Some(value), span: Some(span), children: Vec::new() }
+        Self {
+            label: label.into(),
+            value: Some(value),
+            span: Some(span),
+            children: Vec::new(),
+        }
     }
-    fn node(label: &str, value: Option<String>, span: Option<[u32; 2]>, children: Vec<DecodeNode>) -> Self {
-        Self { label: label.into(), value, span, children }
+    fn node(
+        label: &str,
+        value: Option<String>,
+        span: Option<[u32; 2]>,
+        children: Vec<DecodeNode>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            value,
+            span,
+            children,
+        }
     }
 }
 
@@ -225,7 +248,8 @@ async fn connect_and_serve(
     // Capture thread → async forwarder. We hold `pkt_tx` for the whole
     // connection; each session clones it, so the receiver only sees data while a
     // capture runs and never closes mid-connection.
-    let (pkt_tx, mut pkt_rx) = mpsc::channel::<UplinkMsg>(512);
+    let (_idle_tx, mut pkt_rx) = mpsc::channel::<UplinkMsg>(512);
+    let mut pending_filter: Option<String> = None;
     let mut session: Option<CaptureSession> = None;
     let mut ping = tokio::time::interval(PING_INTERVAL);
 
@@ -238,19 +262,26 @@ async fn connect_and_serve(
                             Ok(ControlMsg::Start { filter }) => {
                                 if session.is_none() {
                                     // The capture thread reports status/filter_result/data via pkt_tx.
-                                    session = Some(CaptureSession::spawn(interface.to_string(), filter, pkt_tx.clone()));
+                                    let (tx, rx) = mpsc::channel(512);
+                                    pkt_rx = rx;
+                                    session = Some(CaptureSession::spawn(interface.to_string(), filter.or_else(|| pending_filter.clone()), tx));
                                 }
                             }
                             Ok(ControlMsg::Stop) => {
                                 session = None; // Drop sets the stop flag → thread exits
+                                pkt_rx = mpsc::channel(1).1; // release blocked producers and queued frames
                                 send_msg(&mut ws_tx, &UplinkMsg::Status { capturing: false, message: "stopped".into() }).await?;
                             }
                             Ok(ControlMsg::SetFilter { bpf }) => {
-                                // Stop the old capture (drop → stop flag), then
-                                // restart with the new filter; the new thread
-                                // reports the authoritative compile result.
-                                drop(session.take());
-                                session = Some(CaptureSession::spawn(interface.to_string(), Some(bpf), pkt_tx.clone()));
+                                pending_filter = Some(bpf.clone());
+                                // Editing a stopped session never starts capture.
+                                if session.is_some() {
+                                    drop(session.take());
+                                    let (tx, rx) = mpsc::channel(512);
+                                    pkt_rx = rx; // discard frames from the previous session
+                                    session = Some(CaptureSession::spawn(interface.to_string(), Some(bpf), tx));
+                                }
+
                             }
                             Err(e) => debug!("dpi uplink: bad control frame: {e}"),
                         }
@@ -262,13 +293,20 @@ async fn connect_and_serve(
                     Some(Err(e)) => return Err(e.into()),
                 }
             }
-            msg = pkt_rx.recv() => {
+            msg = pkt_rx.recv(), if session.is_some() => {
                 if let Some(m) = msg {
+                    if matches!(m, UplinkMsg::Status { capturing: false, .. }) {
+                        session = None; // allow retry after permission/filter/read failure
+                        pkt_rx = mpsc::channel(1).1;
+                    }
                     send_msg(&mut ws_tx, &m).await?;
+                } else {
+                    session = None;
+                    send_msg(&mut ws_tx, &UplinkMsg::Status { capturing: false, message: "capture worker exited".into() }).await?;
                 }
             }
             _ = ping.tick() => {
-                ws_tx.send(Message::Ping(Vec::new().into())).await?;
+                ws_tx.send(Message::Ping(Vec::new())).await?;
             }
         }
     }
@@ -281,9 +319,45 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    tx.send(Message::Text(serde_json::to_string(m)?.into()))
-        .await?;
+    for text in encode_frames(m)? {
+        tokio::time::timeout(Duration::from_secs(10), tx.send(Message::Text(text))).await??;
+    }
     Ok(())
+}
+
+// Stay below the relay's 512 KiB limit even when a batch learns many DNS names.
+fn encode_frames(m: &UplinkMsg) -> anyhow::Result<Vec<String>> {
+    let frames = match m {
+        UplinkMsg::Packets { packets } => packets
+            .chunks(MAX_BATCH)
+            .map(|chunk| {
+                serde_json::to_string(&UplinkMsg::Packets {
+                    packets: chunk.to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        UplinkMsg::Names { source, names } => {
+            let entries: Vec<_> = names.iter().collect();
+            entries
+                .chunks(64)
+                .map(|chunk| {
+                    serde_json::to_string(&UplinkMsg::Names {
+                        source: source.clone(),
+                        names: chunk
+                            .iter()
+                            .map(|(k, v)| ((*k).clone(), (*v).clone()))
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        _ => vec![serde_json::to_string(m)?],
+    };
+    anyhow::ensure!(
+        frames.iter().all(|f| f.len() <= MAX_RELAY_FRAME),
+        "capture frame exceeds relay size limit"
+    );
+    Ok(frames)
 }
 
 // ── capture session (blocking pcap thread) ───────────────────────────────────
@@ -299,11 +373,16 @@ impl CaptureSession {
         let stop2 = stop.clone();
         // pcap's Capture isn't Send-friendly to move across threads, so we open
         // it inside the thread (matches capture.rs). Spawn failures are logged.
+        let error_tx = tx.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("netwatch-dpi-capture".into())
             .spawn(move || run_capture(&interface, filter, tx, stop2))
         {
             warn!("dpi capture thread spawn failed: {e}");
+            let _ = error_tx.try_send(UplinkMsg::Status {
+                capturing: false,
+                message: "could not start capture worker".into(),
+            });
         }
         Self { stop }
     }
@@ -370,7 +449,29 @@ fn run_capture(
         });
     }
 
+    let mut cap = match cap.setnonblock() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.blocking_send(UplinkMsg::Status {
+                capturing: false,
+                message: format!("capture nonblocking mode failed: {e}"),
+            });
+            return;
+        }
+    };
     let linktype = cap.get_datalink();
+    if !matches!(
+        linktype,
+        Linktype::ETHERNET | Linktype::NULL | Linktype::LOOP
+    ) {
+        let _ = tx.blocking_send(UplinkMsg::Status {
+            capturing: false,
+            message: format!(
+                "unsupported capture link type {linktype:?}; select a physical interface"
+            ),
+        });
+        return;
+    }
     let _ = tx.blocking_send(UplinkMsg::Status {
         capturing: true,
         message: "capturing".into(),
@@ -433,7 +534,12 @@ fn run_capture(
                     &redactor,
                     &start,
                 ) {
-                    let Built { packet: p, src_ip, dst_ip, dns_answers } = built;
+                    let Built {
+                        packet: p,
+                        src_ip,
+                        dst_ip,
+                        dns_answers,
+                    } = built;
                     total_n += 1;
                     total_bytes += on_wire as u64;
                     match p.proto.as_str() {
@@ -452,7 +558,7 @@ fn run_capture(
                     // pending reverse lookup for that address.
                     for (name, ip) in dns_answers {
                         let label = redactor.redact_text(&name).to_string();
-                        if names.get(&ip) != Some(&label) {
+                        if names.len() < 4096 && names.get(&ip) != Some(&label) {
                             names.insert(ip, label.clone());
                             pending_names.insert(ip.to_string(), label);
                             ptr_queued.insert(ip);
@@ -460,7 +566,11 @@ fn run_capture(
                     }
                     // Reverse-DNS fallback for endpoints with no name yet.
                     for ip in [src_ip, dst_ip] {
-                        if ptr_eligible(&ip) && !names.contains_key(&ip) && ptr_queued.insert(ip) {
+                        if ptr_queued.len() < 4096
+                            && ptr_eligible(&ip)
+                            && !names.contains_key(&ip)
+                            && ptr_queued.insert(ip)
+                        {
                             let _ = ptr_tx.try_send(ip);
                         }
                     }
@@ -468,9 +578,13 @@ fn run_capture(
                     batch.push(p);
                 }
             }
-            Err(pcap::Error::TimeoutExpired) => {}
+            Err(pcap::Error::TimeoutExpired) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => {
                 debug!("dpi capture read ended: {e}");
+                let _ = tx.blocking_send(UplinkMsg::Status {
+                    capturing: false,
+                    message: format!("capture read failed: {e}"),
+                });
                 break;
             }
         }
@@ -487,7 +601,10 @@ fn run_capture(
             if !pending_names.is_empty() {
                 let names = std::mem::take(&mut pending_names);
                 if tx
-                    .blocking_send(UplinkMsg::Names { source: "dns".into(), names })
+                    .blocking_send(UplinkMsg::Names {
+                        source: "dns".into(),
+                        names,
+                    })
                     .is_err()
                 {
                     break;
@@ -515,6 +632,7 @@ fn run_capture(
             last_stats = Instant::now();
         }
     }
+    stop.store(true, Ordering::Relaxed);
     debug!("dpi capture thread exiting after {} packets", total_n);
 }
 
@@ -547,7 +665,10 @@ fn ptr_resolver_loop(
         let mut names = HashMap::new();
         names.insert(ip.to_string(), redactor.redact_text(host).to_string());
         if tx
-            .blocking_send(UplinkMsg::Names { source: "ptr".into(), names })
+            .blocking_send(UplinkMsg::Names {
+                source: "ptr".into(),
+                names,
+            })
             .is_err()
         {
             break; // uplink gone
@@ -582,6 +703,20 @@ fn build_packet(
     redactor: &Redactor,
     start: &Instant,
 ) -> Option<Built> {
+    // No IP reassembly: a noninitial fragment could masquerade as a transport
+    // header and turn payload bytes into purported header hex.
+    let ip_offset = match linktype {
+        Linktype::ETHERNET => 14,
+        Linktype::NULL | Linktype::LOOP => 4,
+        _ => return None,
+    };
+    let ip = frame.get(ip_offset..)?;
+    if ip.first().map(|b| b >> 4) == Some(4) {
+        let frag = u16::from_be_bytes(ip.get(6..8)?.try_into().ok()?);
+        if frag & 0x3fff != 0 {
+            return None;
+        }
+    }
     let (src_ip, dst_ip, proto, l4) = match linktype {
         Linktype::ETHERNET => capture::parse_ethernet(frame)?,
         Linktype::NULL => capture::parse_bsd_loopback(frame, false)?,
@@ -611,7 +746,9 @@ fn build_packet(
     // resolved to. Harvest them (empty for queries / non-DNS) so endpoint IPs
     // can be labelled with the name that was requested.
     let dns_answers = match meta.as_ref().map(|m| &m.app) {
-        Some(AppProtocol::Dns { .. }) => extract_dns_answers(payload),
+        Some(AppProtocol::Dns { .. }) => dns_message(payload, is_tcp)
+            .map(extract_dns_answers)
+            .unwrap_or_default(),
         _ => Vec::new(),
     };
 
@@ -626,6 +763,9 @@ fn build_packet(
     } else {
         (dst.clone(), src.clone())
     };
+    if !flows.contains_key(&key) && flows.len() >= 4096 {
+        return None;
+    }
     let next = flows.len() as u32 + 1;
     let flow_id = *flows.entry(key).or_insert(next);
 
@@ -724,7 +864,10 @@ fn build_decode(
     meta: Option<&ClassifiedMeta>,
     r: &Redactor,
 ) -> (Vec<DecodeNode>, Option<HexDump>) {
-    let mut tree = vec![DecodeNode::leaf("Frame", format!("{} bytes on wire", frame.len()))];
+    let mut tree = vec![DecodeNode::leaf(
+        "Frame",
+        format!("{} bytes on wire", frame.len()),
+    )];
 
     // ── L2 ──
     let l2_len: usize = match linktype {
@@ -733,7 +876,11 @@ fn build_decode(
                 return (tree, None);
             }
             let mac = |o: usize| {
-                frame[o..o + 6].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+                frame[o..o + 6]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":")
             };
             let etype = u16::from_be_bytes([frame[12], frame[13]]);
             tree.push(DecodeNode::node(
@@ -757,7 +904,11 @@ fn build_decode(
                 "Loopback",
                 None,
                 Some([0, 4]),
-                vec![DecodeNode::leaf_span("Address family", format!("{fam}"), [0, 4])],
+                vec![DecodeNode::leaf_span(
+                    "Address family",
+                    format!("{fam}"),
+                    [0, 4],
+                )],
             ));
             4
         }
@@ -781,17 +932,35 @@ fn build_decode(
             let ttl = frame[l2_len + 8];
             let proto = frame[l2_len + 9];
             let cks = u16::from_be_bytes([frame[l2_len + 10], frame[l2_len + 11]]);
-            let src = std::net::Ipv4Addr::new(frame[l2_len + 12], frame[l2_len + 13], frame[l2_len + 14], frame[l2_len + 15]);
-            let dst = std::net::Ipv4Addr::new(frame[l2_len + 16], frame[l2_len + 17], frame[l2_len + 18], frame[l2_len + 19]);
+            let src = std::net::Ipv4Addr::new(
+                frame[l2_len + 12],
+                frame[l2_len + 13],
+                frame[l2_len + 14],
+                frame[l2_len + 15],
+            );
+            let dst = std::net::Ipv4Addr::new(
+                frame[l2_len + 16],
+                frame[l2_len + 17],
+                frame[l2_len + 18],
+                frame[l2_len + 19],
+            );
             tree.push(DecodeNode::node(
                 "Internet Protocol v4",
                 Some(format!("{src} → {dst}")),
                 Some([l2, l2 + ihl as u32]),
                 vec![
-                    DecodeNode::leaf_span("Version / IHL", format!("4 / {ihl} bytes"), [l2, l2 + 1]),
+                    DecodeNode::leaf_span(
+                        "Version / IHL",
+                        format!("4 / {ihl} bytes"),
+                        [l2, l2 + 1],
+                    ),
                     DecodeNode::leaf_span("TTL", format!("{ttl}"), [l2 + 8, l2 + 9]),
                     DecodeNode::leaf_span("Protocol", proto_name(proto), [l2 + 9, l2 + 10]),
-                    DecodeNode::leaf_span("Header checksum", format!("0x{cks:04x}"), [l2 + 10, l2 + 12]),
+                    DecodeNode::leaf_span(
+                        "Header checksum",
+                        format!("0x{cks:04x}"),
+                        [l2 + 10, l2 + 12],
+                    ),
                     DecodeNode::leaf_span("Source", src.to_string(), [l2 + 12, l2 + 16]),
                     DecodeNode::leaf_span("Destination", dst.to_string(), [l2 + 16, l2 + 20]),
                 ],
@@ -827,8 +996,18 @@ fn build_decode(
     let l7_off = if l4_proto == 6 && frame.len() >= l4_off + 20 {
         let sport = u16::from_be_bytes([frame[l4_off], frame[l4_off + 1]]);
         let dport = u16::from_be_bytes([frame[l4_off + 2], frame[l4_off + 3]]);
-        let seq = u32::from_be_bytes([frame[l4_off + 4], frame[l4_off + 5], frame[l4_off + 6], frame[l4_off + 7]]);
-        let ack = u32::from_be_bytes([frame[l4_off + 8], frame[l4_off + 9], frame[l4_off + 10], frame[l4_off + 11]]);
+        let seq = u32::from_be_bytes([
+            frame[l4_off + 4],
+            frame[l4_off + 5],
+            frame[l4_off + 6],
+            frame[l4_off + 7],
+        ]);
+        let ack = u32::from_be_bytes([
+            frame[l4_off + 8],
+            frame[l4_off + 9],
+            frame[l4_off + 10],
+            frame[l4_off + 11],
+        ]);
         let doff = (((frame[l4_off + 12] >> 4) as usize) * 4).max(20);
         let fl = frame[l4_off + 13];
         let win = u16::from_be_bytes([frame[l4_off + 14], frame[l4_off + 15]]);
@@ -891,9 +1070,18 @@ fn build_decode(
                 if let Some(j) = ja4 {
                     ch.push(DecodeNode::leaf("JA4", rd(j)));
                 }
-                tree.push(DecodeNode::node("Transport Layer Security", Some("ClientHello".into()), None, ch));
+                tree.push(DecodeNode::node(
+                    "Transport Layer Security",
+                    Some("ClientHello".into()),
+                    None,
+                    ch,
+                ));
             }
-            AppProtocol::Http { method, host, status } => {
+            AppProtocol::Http {
+                method,
+                host,
+                status,
+            } => {
                 let mut ch = vec![DecodeNode::leaf("Method", rd(method))];
                 if let Some(h) = host {
                     ch.push(DecodeNode::leaf("Host", rd(h)));
@@ -901,7 +1089,12 @@ fn build_decode(
                 if let Some(s) = status {
                     ch.push(DecodeNode::leaf("Status", format!("{s}")));
                 }
-                tree.push(DecodeNode::node("Hypertext Transfer Protocol", None, None, ch));
+                tree.push(DecodeNode::node(
+                    "Hypertext Transfer Protocol",
+                    None,
+                    None,
+                    ch,
+                ));
             }
             AppProtocol::Dns { qname, qtype } => {
                 tree.push(DecodeNode::node(
@@ -990,10 +1183,14 @@ fn parse_udp_meta(buf: &[u8]) -> Option<(u16, u16, &[u8])> {
     if buf.len() < 8 {
         return None;
     }
+    let len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    if len < 8 {
+        return None;
+    }
     Some((
         u16::from_be_bytes([buf[0], buf[1]]),
         u16::from_be_bytes([buf[2], buf[3]]),
-        &buf[8..],
+        &buf[8..len.min(buf.len())],
     ))
 }
 
@@ -1056,5 +1253,166 @@ mod tests {
         assert_eq!(pct(0, 0), 0);
         assert_eq!(pct(1, 4), 25);
         assert_eq!(pct(4, 4), 100);
+    }
+}
+
+#[cfg(test)]
+mod capture_integration_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io::Write;
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 54];
+        f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14] = 0x45;
+        f[16..18].copy_from_slice(&((40 + payload.len()) as u16).to_be_bytes());
+        f[23] = 6;
+        f[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        f[30..34].copy_from_slice(&[192, 0, 2, 2]);
+        f[34..36].copy_from_slice(&12345u16.to_be_bytes());
+        f[36..38].copy_from_slice(&80u16.to_be_bytes());
+        f[46] = 0x50;
+        f[47] = 0x18;
+        f.extend(payload);
+        f
+    }
+
+    #[test]
+    fn offline_pcap_to_wire_contains_metadata_but_no_payload() {
+        let f=frame(b"POST /SECRET_PATH?token=SECRET_QUERY HTTP/1.1\r\nHost: example.com\r\nAuthorization: Bearer SECRET_AUTH\r\nCookie: SECRET_COOKIE\r\n\r\nSECRET_BODY");
+        let mut pcap = tempfile::NamedTempFile::new().unwrap();
+        pcap.write_all(&[
+            0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 1, 0, 0,
+            0,
+        ])
+        .unwrap();
+        for n in [0u32, 0, f.len() as u32, f.len() as u32] {
+            pcap.write_all(&n.to_le_bytes()).unwrap();
+        }
+        pcap.write_all(&f).unwrap();
+        pcap.flush().unwrap();
+        let mut cap = Capture::from_file(pcap.path()).unwrap();
+        let link = cap.get_datalink();
+        let packet = cap.next_packet().unwrap();
+        let built = build_packet(
+            packet.data,
+            link,
+            packet.header.len,
+            &mut 0,
+            &mut HashMap::new(),
+            &Redactor::redacting(),
+            &Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(built.packet.proto, "HTTP");
+        assert_eq!(built.packet.app, "HTTP · example.com");
+        assert_eq!(built.packet.hex.as_ref().unwrap().bytes, f[..54]);
+        let json = serde_json::to_string(&UplinkMsg::Packets {
+            packets: vec![built.packet],
+        })
+        .unwrap();
+        assert!(!json.contains("SECRET_"), "{json}");
+        assert!(json.contains("example.com"));
+    }
+
+    async fn receive_status<S>(
+        socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let m = socket.next().await.unwrap().unwrap();
+                if let Message::Text(t) = m {
+                    let value: serde_json::Value = serde_json::from_str(&t).unwrap();
+                    if value["type"] == "status" {
+                        return value;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("status timeout")
+    }
+
+    #[tokio::test]
+    async fn websocket_capture_failure_is_visible_and_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            connect_and_serve(
+                &format!("ws://{addr}/uplink"),
+                "fixture",
+                Uuid::nil(),
+                "netwatch-interface-that-does-not-exist",
+                "test",
+            )
+            .await
+        });
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        // A failed worker must be cleared so each fresh start gets a result.
+        for _ in 0..2 {
+            ws.send(Message::Text(r#"{"type":"start"}"#.into()))
+                .await
+                .unwrap();
+            let status = receive_status(&mut ws).await;
+            assert_eq!(status["capturing"], false);
+            assert!(status["message"]
+                .as_str()
+                .unwrap()
+                .contains("interface error"));
+        }
+        ws.send(Message::Text(r#"{"type":"set_filter","bpf":"tcp"}"#.into()))
+            .await
+            .unwrap();
+        ws.send(Message::Text(r#"{"type":"stop"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(receive_status(&mut ws).await["message"], "stopped");
+        ws.send(Message::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn malformed_frames_never_panic(f in prop::collection::vec(any::<u8>(),0..2048)) {
+            for link in [Linktype::ETHERNET,Linktype::NULL,Linktype::LOOP] {
+                let _=build_packet(&f,link,f.len() as u32,&mut 0,&mut HashMap::new(),&Redactor::redacting(),&Instant::now());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wire_limit_tests {
+    use super::*;
+    #[test]
+    fn dns_names_are_split_without_loss_before_relay_limit() {
+        let names: HashMap<_, _> = (0..4096)
+            .map(|i| (format!("2001:db8::{i:x}"), "x".repeat(256)))
+            .collect();
+        let frames = encode_frames(&UplinkMsg::Names {
+            source: "dns".into(),
+            names: names.clone(),
+        })
+        .unwrap();
+        assert!(frames.len() > 1);
+        let mut restored = HashMap::new();
+        for frame in frames {
+            assert!(frame.len() <= MAX_RELAY_FRAME);
+            let json: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            for (ip, name) in json["names"].as_object().unwrap() {
+                restored.insert(ip.clone(), name.as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(restored, names);
     }
 }
