@@ -10,6 +10,7 @@ mod dpi_uplink;
 mod host;
 mod otel;
 mod probe;
+mod rates;
 mod sender;
 mod update;
 
@@ -159,7 +160,11 @@ async fn main() -> Result<()> {
         let mut send_succeeded = false;
 
         while !send_succeeded {
-            match sender.send(snapshot.clone(), collector.report()) {
+            match sender.send(
+                snapshot.clone(),
+                collector.report(),
+                collector.rate_report(),
+            ) {
                 Ok(()) => {
                     info!("snapshot sent");
                     send_succeeded = true;

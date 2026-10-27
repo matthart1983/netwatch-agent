@@ -2,7 +2,7 @@ use crate::config::AgentConfig;
 use chrono::Utc;
 use netwatch_sdk::collectors::network_intel::{InterfaceRateEvent, NetworkIntelCollector};
 use netwatch_sdk::collectors::{
-    config as net_config, connections, disk, health, proc_meta, process_bandwidth, system, traffic,
+    config as net_config, connections, disk, health, proc_meta, system,
 };
 use netwatch_sdk::types::{HealthMetric, InterfaceMetric, Snapshot, SystemMetric};
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,9 @@ const MAX_PROCESSES_PER_SNAPSHOT: usize = 25;
 
 pub struct MetricsCollector {
     evidence: crate::collector_evidence::CollectorReport,
-    rate_tracker: traffic::InterfaceRateTracker,
-    proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker,
+    rate_tracker: crate::rates::InterfaceRates,
+    rate_report: crate::rates::RateReport,
+    proc_bw_tracker: crate::rates::ProcessRates,
     gateway_rtt_history: health::RttHistory,
     dns_rtt_history: health::RttHistory,
     intel: Arc<Mutex<NetworkIntelCollector>>,
@@ -49,8 +50,9 @@ impl MetricsCollector {
 
         Self {
             evidence: Default::default(),
-            rate_tracker: traffic::InterfaceRateTracker::new(),
-            proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker::new(),
+            rate_tracker: Default::default(),
+            rate_report: Default::default(),
+            proc_bw_tracker: Default::default(),
             gateway_rtt_history: health::RttHistory::new(),
             dns_rtt_history: health::RttHistory::new(),
             intel: Arc::new(Mutex::new(intel)),
@@ -71,7 +73,12 @@ impl MetricsCollector {
         &self.evidence
     }
 
+    pub fn rate_report(&self) -> &crate::rates::RateReport {
+        &self.rate_report
+    }
+
     pub fn collect(&mut self, include_health: bool) -> Snapshot {
+        self.rate_report = Default::default();
         let interfaces = self.collect_interfaces();
         let health = if include_health {
             Some(self.collect_health())
@@ -159,10 +166,12 @@ impl MetricsCollector {
         );
         let processes = {
             // Real per-process bandwidth measured from per-socket byte deltas
-            // (see ProcessBandwidthTracker), not the old proportional split.
-            let mut ranked = self
-                .proc_bw_tracker
-                .sample(&raw_connections, MAX_PROCESSES_PER_SNAPSHOT);
+            // (see rates::ProcessRates), not the old proportional split.
+            let mut ranked = self.proc_bw_tracker.sample(
+                &raw_connections,
+                MAX_PROCESSES_PER_SNAPSHOT,
+                &mut self.rate_report,
+            );
             // Identity/resource detail (user, cpu%, mem, state, started, exe
             // path) from one ps sample. Best-effort: a failed ps leaves the
             // rows network-only, which the backend treats like a v1 agent.
@@ -218,7 +227,10 @@ impl MetricsCollector {
     }
 
     fn collect_interfaces(&mut self) -> Vec<InterfaceMetric> {
-        let mut metrics = match traffic::sample(&mut self.rate_tracker) {
+        let mut metrics = match self
+            .rate_tracker
+            .collect(&self.filter_interfaces, &mut self.rate_report)
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("failed to collect interface stats: {}", e);

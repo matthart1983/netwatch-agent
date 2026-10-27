@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-agent"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Lightweight agent for NetWatch Cloud — collects network, system, and process metrics on Linux and macOS hosts and POSTs them to the hosted SaaS backend."
 license = "MIT"

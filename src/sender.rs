@@ -1,5 +1,5 @@
 use crate::config::AgentConfig;
-use netwatch_sdk::types::{HostInfo, IngestRequest, IngestResponse, Snapshot};
+use netwatch_sdk::types::{HostInfo, IngestResponse, Snapshot};
 use std::collections::VecDeque;
 
 const MAX_BUFFER: usize = 100;
@@ -20,10 +20,10 @@ const SCHEMA_VERSION: u32 = 1;
 /// so the standalone agent reports liveness/backlog the same way netwatch's
 /// built-in daemon does (Core stores these on the `hosts` row).
 #[derive(serde::Serialize)]
-struct IngestEnvelope<'a> {
+struct IngestEnvelope<'a, T: serde::Serialize> {
     schema_version: u32,
     #[serde(flatten)]
-    request: &'a IngestRequest,
+    request: &'a T,
     agent_health: AgentHealth,
 }
 
@@ -35,11 +35,18 @@ struct AgentHealth {
     queue_depth: u64,
 }
 
+#[derive(serde::Serialize)]
+struct RatedRequest<'a> {
+    agent_version: String,
+    host: &'a HostInfo,
+    snapshots: &'a [crate::rates::RatedSnapshot],
+}
+
 pub struct Sender {
     endpoint: String,
     api_key: String,
     host_info: HostInfo,
-    buffer: VecDeque<Snapshot>,
+    buffer: VecDeque<crate::rates::RatedSnapshot>,
     consecutive_failures: u32,
     /// Snapshots discarded because the retry buffer overflowed `MAX_BUFFER`.
     /// Reported in `agent_health.dropped_count`.
@@ -66,19 +73,23 @@ impl Sender {
         &mut self,
         snapshot: Snapshot,
         report: &crate::collector_evidence::CollectorReport,
+        rates: &crate::rates::RateReport,
     ) -> Result<(), String> {
-        self.buffer.push_back(snapshot);
+        self.buffer.push_back(crate::rates::RatedSnapshot {
+            snapshot,
+            rate_report: rates.clone(),
+        });
 
         // Drain buffer into a single request
-        let snapshots: Vec<Snapshot> = self.buffer.drain(..).collect();
+        let snapshots: Vec<crate::rates::RatedSnapshot> = self.buffer.drain(..).collect();
         // Backlog being flushed in this batch (1 when healthy, higher once
         // sends have been failing and snapshots have queued up).
         let queue_depth = snapshots.len() as u64;
 
-        let request = IngestRequest {
+        let request = RatedRequest {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
-            host: self.host_info.clone(),
-            snapshots: snapshots.clone(),
+            host: &self.host_info,
+            snapshots: &snapshots,
         };
         let envelope = IngestEnvelope {
             schema_version: SCHEMA_VERSION,
@@ -249,7 +260,7 @@ impl Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netwatch_sdk::types::HostInfo;
+    use netwatch_sdk::types::{HostInfo, IngestRequest};
 
     #[test]
     fn envelope_carries_schema_version_and_agent_health() {

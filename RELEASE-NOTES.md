@@ -1,13 +1,13 @@
-NetWatch Agent v0.6.1 reports collector availability without fabricating network loss.
+NetWatch Agent v0.6.2 distinguishes measured zero traffic from incomplete rate evidence.
 
-- Adds timestamped latest collector-attempt evidence for NetWatch Cloud.
-- Removes unconditional healthy collector reporting. Collectors with hidden failure outcomes remain explicitly unknown.
-- Separates ICMP probe execution/parsing failures from observed packet loss; failures now leave RTT/loss unavailable.
-- Bounds each gateway/resolver probe to eight seconds and preserves probe timestamps between health cycles.
-- Keeps the v0.6.0 capture restoration and SDK 0.4.1 fixes.
+- Interface first samples, counter resets and reappearances no longer report fabricated zero rates. Failed collection clears the baseline; a gap over 24 hours re-establishes it.
+- Each snapshot includes directional baseline, missing-counter and reset counts, disappearance counts, elapsed intervals and process-list truncation.
+- Process rates use observed established-socket counter deltas, with protocol/endpoints/owner keys. Unknown socket visibility and PID/tuple reuse remain limitations; this is not complete per-process traffic accounting.
+- Buffered snapshots retain their own evidence. Cloud and standalone dashboard readers show incomplete rates as unavailable while keeping genuine zeroes.
+- Retains v0.6.1 collector failure reporting and v0.6.0 capture fixes.
 
-Collector reports describe latest attempts, not historical quality or complete resource coverage. Connections, TCP states, disk and process bandwidth still have unknown collection outcomes. Resolver probing is ICMP, not DNS query latency. Native macOS behavior has not been verified for this change.
+Deploy the matching Cloud API/UI before upgrading agents. Legacy servers accept the additive wire fields but cannot interpret process coverage and may display placeholder zeroes. Legacy integer interface histories are omitted because they cannot represent gaps; Cloud charts use stored observations.
 
-Linux x86_64 and aarch64 binaries include libpcap statically and require glibc 2.35 or newer. Verify downloads against `SHA256SUMS`. Source builds use system libpcap; Alpine/musl needs a separate build.
+Linux x86_64 and aarch64 binaries include libpcap statically and require glibc 2.35 or newer. Verify downloads against SHA256SUMS. Source builds use system libpcap; Alpine/musl needs a separate build. Native macOS behavior was not verified in this change.
 
-Upgrade: `sudo netwatch-agent update`. Configuration is preserved; capture remains off unless previously enabled. New Cloud collector evidence requires this agent update. Older servers ignore the optional report and continue accepting metrics.
+Upgrade: `sudo netwatch-agent update`. Existing configuration and capture settings are preserved.
