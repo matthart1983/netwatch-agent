@@ -29,7 +29,8 @@ struct IngestEnvelope<'a> {
 
 #[derive(serde::Serialize)]
 struct AgentHealth {
-    collectors_ok: bool,
+    collectors_ok: Option<bool>,
+    collector_report: crate::collector_evidence::CollectorReport,
     dropped_count: u64,
     queue_depth: u64,
 }
@@ -61,7 +62,11 @@ impl Sender {
         self.buffer.len()
     }
 
-    pub fn send(&mut self, snapshot: Snapshot) -> Result<(), String> {
+    pub fn send(
+        &mut self,
+        snapshot: Snapshot,
+        report: &crate::collector_evidence::CollectorReport,
+    ) -> Result<(), String> {
         self.buffer.push_back(snapshot);
 
         // Drain buffer into a single request
@@ -79,9 +84,8 @@ impl Sender {
             schema_version: SCHEMA_VERSION,
             request: &request,
             agent_health: AgentHealth {
-                // The agent collects inline (no panicking collector threads like
-                // the daemon), so it's healthy whenever it's alive to send.
-                collectors_ok: true,
+                collectors_ok: report.collectors_ok(),
+                collector_report: report.clone(),
                 dropped_count: self.dropped_count,
                 queue_depth,
             },
@@ -263,11 +267,14 @@ mod tests {
             },
             snapshots: vec![],
         };
+        let mut report = crate::collector_evidence::CollectorReport::default();
+        report.record("connections", "unknown", "sdk_outcome_unavailable");
         let envelope = IngestEnvelope {
             schema_version: SCHEMA_VERSION,
             request: &request,
             agent_health: AgentHealth {
-                collectors_ok: true,
+                collectors_ok: report.collectors_ok(),
+                collector_report: report,
                 dropped_count: 3,
                 queue_depth: 2,
             },
@@ -283,7 +290,15 @@ mod tests {
             v["snapshots"].is_array(),
             "snapshots flattened to top level"
         );
-        assert_eq!(v["agent_health"]["collectors_ok"], true);
+        assert!(v["agent_health"]["collectors_ok"].is_null());
+        assert_eq!(v["agent_health"]["collector_report"]["version"], 1);
+        assert_eq!(
+            v["agent_health"]["collector_report"]["collectors"]["connections"]["status"],
+            "unknown"
+        );
+        // Legacy SDK receivers ignore the added envelope fields.
+        let legacy: IngestRequest = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(legacy.host.hostname, "edge-1");
         assert_eq!(v["agent_health"]["dropped_count"], 3);
         assert_eq!(v["agent_health"]["queue_depth"], 2);
     }

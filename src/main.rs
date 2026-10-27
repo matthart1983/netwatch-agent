@@ -4,10 +4,12 @@ use tracing::{info, warn};
 
 mod capture;
 mod collector;
+mod collector_evidence;
 mod config;
 mod dpi_uplink;
 mod host;
 mod otel;
+mod probe;
 mod sender;
 mod update;
 
@@ -157,7 +159,7 @@ async fn main() -> Result<()> {
         let mut send_succeeded = false;
 
         while !send_succeeded {
-            match sender.send(snapshot.clone()) {
+            match sender.send(snapshot.clone(), collector.report()) {
                 Ok(()) => {
                     info!("snapshot sent");
                     send_succeeded = true;

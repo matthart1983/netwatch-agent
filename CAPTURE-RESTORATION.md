@@ -48,8 +48,5 @@ Agent fixes in this checkout:
 - Flow/name tracking is bounded; IP fragments are not treated as TCP/UDP headers.
 - Unsupported link types and capture errors produce explicit status messages.
 
-The server currently treats its requested capture state as authoritative even
-when the agent reports a failed start. It forwards the error message, but the
-button can still say Stop capture until explicitly stopped. This does not prevent
-successful capture; correcting the relay's requested/actual state distinction
-remains a separate server change. See the crate README for protocol coverage.
+The Cloud requested/confirmed capture distinction was corrected and deployed in
+Cloud revision 681bb1f on 27 October 2026. See the crate README for protocol coverage.

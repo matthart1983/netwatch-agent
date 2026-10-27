@@ -60,5 +60,5 @@ jobs:
           sha256sum netwatch-agent-linux-* > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" netwatch-agent-linux-* SHA256SUMS LICENSE-libpcap \
             --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-            --title "$GITHUB_REF_NAME — live metadata capture" \
+            --title "$GITHUB_REF_NAME" \
             --notes-file ../RELEASE-NOTES.md

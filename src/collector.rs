@@ -2,8 +2,7 @@ use crate::config::AgentConfig;
 use chrono::Utc;
 use netwatch_sdk::collectors::network_intel::{InterfaceRateEvent, NetworkIntelCollector};
 use netwatch_sdk::collectors::{
-    config as net_config, connections, disk, health, proc_meta, process_bandwidth, system,
-    traffic,
+    config as net_config, connections, disk, health, proc_meta, process_bandwidth, system, traffic,
 };
 use netwatch_sdk::types::{HealthMetric, InterfaceMetric, Snapshot, SystemMetric};
 use std::sync::{Arc, Mutex};
@@ -16,6 +15,7 @@ const MAX_CONNECTIONS_PER_SNAPSHOT: usize = 100;
 const MAX_PROCESSES_PER_SNAPSHOT: usize = 25;
 
 pub struct MetricsCollector {
+    evidence: crate::collector_evidence::CollectorReport,
     rate_tracker: traffic::InterfaceRateTracker,
     proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker,
     gateway_rtt_history: health::RttHistory,
@@ -48,6 +48,7 @@ impl MetricsCollector {
         }
 
         Self {
+            evidence: Default::default(),
             rate_tracker: traffic::InterfaceRateTracker::new(),
             proc_bw_tracker: process_bandwidth::ProcessBandwidthTracker::new(),
             gateway_rtt_history: health::RttHistory::new(),
@@ -66,6 +67,10 @@ impl MetricsCollector {
         Arc::clone(&self.intel)
     }
 
+    pub fn report(&self) -> &crate::collector_evidence::CollectorReport {
+        &self.evidence
+    }
+
     pub fn collect(&mut self, include_health: bool) -> Snapshot {
         let interfaces = self.collect_interfaces();
         let health = if include_health {
@@ -79,6 +84,22 @@ impl MetricsCollector {
             let mem = system::read_memory();
             let load = system::read_load_avg();
             let swap = system::read_swap();
+            for (name, present) in [
+                ("cpu", cpu.is_some()),
+                ("memory", mem.is_some()),
+                ("load", load.is_some()),
+                ("swap", swap.is_some()),
+            ] {
+                self.evidence.record(
+                    name,
+                    if present { "observed" } else { "unavailable" },
+                    if present {
+                        "sample_returned"
+                    } else {
+                        "no_sample"
+                    },
+                );
+            }
             Some(SystemMetric {
                 cpu_usage_pct: cpu,
                 memory_total_bytes: mem.as_ref().map(|m| m.total_bytes),
@@ -111,6 +132,20 @@ impl MetricsCollector {
             intel.tick();
         }
 
+        // These SDK APIs collapse failures into empty/zero results. Preserve
+        // that limitation rather than claiming successful collection.
+        for name in [
+            "connections",
+            "tcp_states",
+            "disk_usage",
+            "disk_io",
+            "process_bandwidth",
+        ] {
+            self.evidence
+                .record(name, "unknown", "sdk_outcome_unavailable");
+        }
+        self.evidence
+            .record("process_metadata", "unknown", "not_attempted");
         let tcp_states = connections::collect_tcp_states();
         let disk_usage_data = disk::collect_disk_usage();
         let disk_io_data = disk::collect_disk_io();
@@ -134,6 +169,11 @@ impl MetricsCollector {
             if !ranked.is_empty() {
                 if let Some(meta) = proc_meta::sample() {
                     proc_meta::apply(&mut ranked, &meta);
+                    self.evidence
+                        .record("process_metadata", "observed", "sample_returned");
+                } else {
+                    self.evidence
+                        .record("process_metadata", "unavailable", "no_sample");
                 }
             }
             if ranked.is_empty() {
@@ -182,6 +222,8 @@ impl MetricsCollector {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("failed to collect interface stats: {}", e);
+                self.evidence
+                    .record("interfaces", "unavailable", "collection_failed");
                 return Vec::new();
             }
         };
@@ -190,23 +232,32 @@ impl MetricsCollector {
             metrics.retain(|m| self.filter_interfaces.iter().any(|f| f == &m.name));
         }
 
+        self.evidence.record(
+            "interfaces",
+            if metrics.is_empty() {
+                "unavailable"
+            } else {
+                "observed"
+            },
+            if metrics.is_empty() {
+                "no_matching_interfaces"
+            } else {
+                "sample_returned"
+            },
+        );
         metrics
     }
 
     fn collect_health(&mut self) -> HealthMetric {
-        let (gateway_rtt, gateway_loss, gateway_ip) = if let Some(ref gw) = self.gateway {
-            let result = health::run_ping(gw);
-            (result.rtt_ms, Some(result.loss_pct), Some(gw.clone()))
-        } else {
-            (None, None, None)
-        };
-
-        let (dns_rtt, dns_loss, dns_ip) = if let Some(ref dns) = self.dns_server {
-            let result = health::run_ping(dns);
-            (result.rtt_ms, Some(result.loss_pct), Some(dns.clone()))
-        } else {
-            (None, None, None)
-        };
+        let gateway = crate::probe::run(self.gateway.as_deref());
+        self.evidence
+            .record("gateway_icmp", gateway.status, gateway.reason);
+        let dns = crate::probe::run(self.dns_server.as_deref());
+        self.evidence
+            .record("resolver_icmp", dns.status, dns.reason);
+        let (gateway_rtt, gateway_loss, gateway_ip) =
+            (gateway.rtt, gateway.loss, self.gateway.clone());
+        let (dns_rtt, dns_loss, dns_ip) = (dns.rtt, dns.loss, self.dns_server.clone());
 
         self.gateway_rtt_history.push(gateway_rtt);
         self.dns_rtt_history.push(dns_rtt);
