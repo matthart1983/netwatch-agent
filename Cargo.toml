@@ -1,6 +1,6 @@
 [package]
 name = "netwatch-agent"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Lightweight agent for NetWatch Cloud — collects network, system, and process metrics on Linux and macOS hosts and POSTs them to the hosted SaaS backend."
 license = "MIT"
@@ -9,6 +9,7 @@ homepage = "https://github.com/matthart1983/netwatch-agent"
 readme = "README.md"
 
 [dependencies]
+tempfile = "3"
 netwatch-sdk = "0.4.1"   # 0.4.1 fixes a `DateTime - TimeDelta` overflow panic in proc_meta
 # In-tree metadata-only classifier and source-side redaction.
 netwatch-dpi = { path = "crates/netwatch-dpi" }
@@ -35,7 +36,6 @@ opentelemetry_sdk = { version = "0.27", features = ["metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
 
 [dev-dependencies]
-tempfile = "3"
 proptest = "1"
 
 [workspace]

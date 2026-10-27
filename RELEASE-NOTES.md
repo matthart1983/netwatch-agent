@@ -1,13 +1,11 @@
-NetWatch Agent v0.6.2 distinguishes measured zero traffic from incomplete rate evidence.
+NetWatch Agent v0.6.3 fixes self-update on a running Linux executable.
 
-- Interface first samples, counter resets and reappearances no longer report fabricated zero rates. Failed collection clears the baseline; a gap over 24 hours re-establishes it.
-- Each snapshot includes directional baseline, missing-counter and reset counts, disappearance counts, elapsed intervals and process-list truncation.
-- Process rates use observed established-socket counter deltas, with protocol/endpoints/owner keys. Unknown socket visibility and PID/tuple reuse remain limitations; this is not complete per-process traffic accounting.
-- Buffered snapshots retain their own evidence. Cloud and standalone dashboard readers show incomplete rates as unavailable while keeping genuine zeroes.
-- Retains v0.6.1 collector failure reporting and v0.6.0 capture fixes.
+- Stages the replacement beside the installed executable and atomically renames it, avoiding Linux `Text file busy` (ETXTBSY).
+- Uses a private download directory and verifies the release SHA256SUMS before running or installing the download.
+- Checks the downloaded version command and reports service restart failures accurately.
+- Restores the SELinux executable label where restorecon is installed.
+- Retains v0.6.2 rate coverage/baseline metadata and the earlier capture fixes.
 
-Deploy the matching Cloud API/UI before upgrading agents. Legacy servers accept the additive wire fields but cannot interpret process coverage and may display placeholder zeroes. Legacy integer interface histories are omitted because they cannot represent gaps; Cloud charts use stored observations.
+Older installed updaters cannot apply this fix themselves. Use the repository's `scripts/install-update.sh` once with sudo; it downloads this pinned release, checks its checksum, atomically replaces `/usr/local/bin/netwatch-agent`, restores its SELinux label and restarts the service. Subsequent updates can use `sudo netwatch-agent update`.
 
-Linux x86_64 and aarch64 binaries include libpcap statically and require glibc 2.35 or newer. Verify downloads against SHA256SUMS. Source builds use system libpcap; Alpine/musl needs a separate build. Native macOS behavior was not verified in this change.
-
-Upgrade: `sudo netwatch-agent update`. Existing configuration and capture settings are preserved.
+Linux x86_64 and aarch64 binaries include libpcap statically and require glibc 2.35 or newer. Configuration and capture settings are preserved.
